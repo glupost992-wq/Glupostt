@@ -1,41 +1,3103 @@
 -- glupost hub v16.8.8 (FINAL - all scope issues fixed)
 
-
-
 if getgenv().GlupostHubLoaded then return end
 
-
-
 -- ===== ЗАГРУЗКА БИБЛИОТЕК =====
-
 local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
-
 local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
-
 local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
-
 local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
-
-
 
 getgenv().GlupostHubLoaded = true
 
-
-
 -- ===== КОНСТАНТЫ =====
-
 local CONST = {
-
     SILENT_RAY_LENGTH = 9999,
-
     VISIBLE_UPDATE_INTERVAL = 0.2,
-
     FULL_UPDATE_INTERVAL = 0.033,
-
     SKELETON_INTERVAL = 0.066,
-
     TEXT_INTERVAL = 0.1,
-
     ARROW_INTERVAL = 0.066,
-
     PREDICTION_CACHE_INTERVAL = 0.1,
+    FPS_SAMPLE_COUNT = 30,
+    DRAW_COUNT_UPDATE_INTERVAL = 0.5,
+    RCS_MAX_STEP_ANGLE = 3,
+    AUTO_FIRE_MIN_COOLDOWN = 0.035,
+    AUTO_FIRE_MAX_COOLDOWN = 0.065,
+    RAPID_FIRE_MIN_COOLDOWN = 0.008,
+    RAPID_FIRE_MAX_COOLDOWN = 0.015,
+    KILL_AURA_CYCLE_DELAY = 0.1,
+    MAX_RECOIL_PATTERNS = 20,
+    DYNAMIC_FOV_MAX_INCREASE = 80,
+    DYNAMIC_FOV_MOUSE_FACTOR = 0.05,
+    DYNAMIC_FOV_MOVE_FACTOR = 1.5,
+    PREDICTION_MIN_DT = 0.001,
+    ANGLE_SAFETY_DEG = 30,
+    DEFAULT_GRAVITY = 196.2,
+    HITBOX_OFFSET_RANGE = 2.5,
+    TARGET_LOSE_TIMEOUT = 0.5,
+    HOOK_RECOVERY_INTERVAL = 5,
+}
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LP = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+local UIS = game:GetService("UserInputService")
+
+if not Drawing then error("Drawing API not supported") end
+
+-- ===== УТИЛИТЫ =====
+local function isPartValid(part)
+    if not part or not part:IsA("BasePart") then return false end
+    return part.CanQuery
+end
+
+local function safeDestroy(obj)
+    if obj then
+        pcall(function()
+            if typeof(obj) == "Instance" then
+                obj:Destroy()
+            elseif obj.Remove then
+                obj:Remove()
+            else
+                obj.Visible = false
+            end
+        end)
+    end
+end
+
+local function getRandomDelay(min, max)
+    return min + math.random() * (max - min)
+end
+
+-- ===== ФУНКЦИИ ДЛЯ RCS =====
+local recoilPatterns = {}
+local recoilPatternOrder = {}
+local currentRecoilPattern = nil
+local recoilStep = 0
+local lastShotTick = 0
+
+local function jitterOffset()
+    return Vector3.new(
+        (math.random() - 0.5) * 2 * CONST.HITBOX_OFFSET_RANGE / 100,
+        (math.random() - 0.5) * 2 * CONST.HITBOX_OFFSET_RANGE / 100,
+        (math.random() - 0.5) * 2 * CONST.HITBOX_OFFSET_RANGE / 100
+    )
+end
+
+local function addRecoilPattern(toolName)
+    if not recoilPatterns[toolName] then
+        if #recoilPatternOrder >= CONST.MAX_RECOIL_PATTERNS then
+            local oldest = table.remove(recoilPatternOrder, 1)
+            recoilPatterns[oldest] = nil
+        end
+        recoilPatterns[toolName] = {}
+        table.insert(recoilPatternOrder, toolName)
+    end
+end
+
+local function recordRecoilStart()
+    if not Config.Aimbot.RCSEnabled or not Config.Aimbot.RCSAdaptiveLearning then
+        return
+    end
+    local tool = LP.Character and LP.Character:FindFirstChildOfClass("Tool")
+    local toolName = tool and tool.Name or "Unknown"
+    addRecoilPattern(toolName)
+    currentRecoilPattern = recoilPatterns[toolName]
+    recoilStep = 0
+    lastShotTick = os.clock()
+    currentRecoilPattern.startCFrame = Camera.CFrame
+end
+
+local function recordRecoilUpdate()
+    if not currentRecoilPattern or not Config.Aimbot.RCSAdaptiveLearning then
+        return
+    end
+    local now = os.clock()
+    local dt = now - lastShotTick
+    if dt > 0.3 then
+        currentRecoilPattern = nil
+        return
+    end
+    if dt < 0.02 then
+        return
+    end
+
+    local startCF = currentRecoilPattern.startCFrame
+    local currentCF = cachedCameraCFrame
+    local delta = startCF:ToObjectSpace(currentCF)
+    local rx, ry, rz = delta:ToEulerAnglesYXZ()
+    local angle = math.deg(math.sqrt(rx*rx + ry*ry))
+    if angle > CONST.RCS_MAX_STEP_ANGLE then
+        return
+    end
+    local stepData = {dx = math.deg(rx), dy = math.deg(ry)}
+    if recoilStep >= #currentRecoilPattern then
+        table.insert(currentRecoilPattern, stepData)
+    else
+        local old = currentRecoilPattern[recoilStep+1]
+        if old then
+            old.dx = (old.dx + stepData.dx) / 2
+            old.dy = (old.dy + stepData.dy) / 2
+        end
+    end
+    recoilStep = recoilStep + 1
+    lastShotTick = now
+end
+
+local function applyAdaptiveRCS(targetPos)
+    if not Config.Aimbot.RCSEnabled or not currentRecoilPattern or recoilStep == 0 then
+        return targetPos
+    end
+    
+    local mouseDelta = UIS:GetMouseDelta()
+    if mouseDelta.Magnitude > (Config.Aimbot.MouseMoveThreshold or 30) then
+        return targetPos
+    end
+    
+    local totalDx, totalDy = 0, 0
+    for i = 1, recoilStep do
+        local step = currentRecoilPattern[i]
+        if step then
+            totalDx = totalDx + step.dx
+            totalDy = totalDy + step.dy
+        end
+    end
+    local cameraCF = cachedCameraCFrame
+    local right = cameraCF.RightVector
+    local up = cameraCF.UpVector
+    local dist = (cameraCF.Position - targetPos).Magnitude
+    local compensation = (right * totalDy + up * totalDx) * dist * 0.001 * Config.Aimbot.RCSStrength
+    return targetPos - compensation
+end
+
+-- ===== ANTI-AIM (объявлены до использования) =====
+local antiAimGyro = nil
+local destroyAntiAim = nil
+
+-- ===== КОНФИГУРАЦИЯ =====
+local LegitConfig = {
+    ESP = {
+        Enabled = true, BoxType = "2D", BoxColor = Color3.fromRGB(0,255,0), BoxThickness = 2,
+        Skeleton = false, SkeletonColor = Color3.fromRGB(255,0,0), SkeletonThickness = 2,
+        HideTeammates = false, MaxDistance = 500, MinDistance = 0,
+        ShowHealth = true, ShowName = true, ShowTracer = false, ShowDistance = true,
+        TracerColor = Color3.fromRGB(255,255,255), TracerThickness = 1,
+        OffscreenArrows = true, ArrowColor = Color3.fromRGB(255,255,0), ArrowSize = 20,
+        VisibleCheck = true, VisibleColor = Color3.fromRGB(0,255,0), OccludedColor = Color3.fromRGB(255,200,0),
+        Chams = false, ChamsVisibleColor = Color3.fromRGB(0,255,0), ChamsOccludedColor = Color3.fromRGB(255,0,0), ChamsTransparency = 0.5,
+        PriorityTarget = true, PriorityColor = Color3.fromRGB(255,215,0),
+        EnemyColor = Color3.fromRGB(255,0,0), AllyColor = Color3.fromRGB(0,255,0), ShowFPS = false,
+        ShowThreatScore = false,
+    },
+    Aimbot = {
+        Enabled = true,
+        CameraEnabled = true,
+        SilentEnabled = true,
+        TargetPart = "Head",
+        TeamCheck = true,
+        WallCheck = true,
+        SmoothnessType = "HumanLike",
+        Smoothness = 0.3,
+        HumanizeOscillation = 2.5,
+        HumanizeFrequency = 1.2,
+        HitChance = 100,
+        RCSEnabled = true,
+        RCSAdaptiveLearning = true,
+        RCSStrength = 0.6,
+        MouseMoveThreshold = 30,
+        PriorityMode = "Threat",
+        ShowFOV = true,
+        FOVShape = "Circle",
+        FOVRadius = 150,
+        DynamicFOV = false,
+        FOVColor = Color3.fromRGB(255,255,255),
+        FOVThickness = 2,
+        FilledFOV = false,
+        FOVTransparency = 0.3,
+        AimbotKey = Enum.UserInputType.MouseButton2,
+        Humanize = true,
+        ReactionTime = 0.03,
+        Prediction = true,
+        PredictionFactor = 0.08,
+        VelocitySmoothing = 0.7,
+        TargetSwitchDelay = 0.1,
+        UseDeferESP = false,
+        SilentMaxAngle = 30,
+        RandomBone = false,
+        BoneWeights = { Head = 0.15, Torso = 0.60, LowerTorso = 0.25 },
+        GravityFactor = 1.0,
+    },
+    ThreatWeights = {
+        Visibility = 0.4,
+        LookAtMe = 0.3,
+        Distance = 0.2,
+        Health = 0.1,
+    }
+}
+
+local RageConfig = {
+    ESP = {},
+    RageMasterSwitch = false,
+    Aimbot = {
+        Enabled = true,
+        CameraEnabled = true,
+        SilentEnabled = true,
+        TargetPart = "Head",
+        TeamCheck = false,
+        WallCheck = false,
+        SmoothnessType = "Instant",
+        Smoothness = 0,
+        HumanizeOscillation = 0,
+        HumanizeFrequency = 0,
+        HitChance = 100,
+        RCSEnabled = false,
+        RCSAdaptiveLearning = false,
+        RCSStrength = 0,
+        MouseMoveThreshold = 999,
+        PriorityMode = "Distance",
+        ShowFOV = true,
+        FOVShape = "Circle",
+        FOVRadius = 999,
+        DynamicFOV = false,
+        FOVColor = Color3.fromRGB(255, 0, 0),
+        FOVThickness = 3,
+        FilledFOV = false,
+        FOVTransparency = 0.4,
+        AimbotKey = Enum.UserInputType.MouseButton2,
+        Humanize = false,
+        ReactionTime = 0,
+        Prediction = true,
+        PredictionFactor = 0.12,
+        VelocitySmoothing = 0.95,
+        TargetSwitchDelay = 0,
+        UseDeferESP = false,
+        SilentMaxAngle = 180,
+        RandomBone = false,
+        BoneWeights = { Head = 0.90, Torso = 0.10 },
+        GravityFactor = 1.0,
+    },
+    RageFeatures = {
+        Enabled = false,
+        AutoWall = false,
+        PenetrationPower = 100,
+        AutoFire = false,
+        RapidFire = false,
+        NoSpread = false,
+        KillAura = false,
+        KillAuraRadius = 100,
+        Triggerbot = false,
+        AntiAimMode = "Off",
+        SpinSpeed = 25,
+        TeleportKill = false,
+        TeleportKey = Enum.KeyCode.Q,
+        MultiPoint = false,
+        MultiPointSpread = 2.0,
+        DoubleTap = false,
+        DTDelay = 0.05,
+        Spinbot = false,
+    },
+    ThreatWeights = { Visibility = 0, LookAtMe = 0, Distance = 1, Health = 0 },
+}
+
+local Config = LegitConfig
+local RageActive = false
+
+-- ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
+local currentTarget = nil
+local lockedTarget = nil
+local targetLoseTimer = 0
+local lastTargetSwitch = 0
+local killAuraTargetsCache = {}
+local killAuraIndex = nil
+local killAuraLastUpdate = 0
+local playersData, connections, renderData, drawingPool = {}, {}, {}, { lines={}, corners={}, texts={}, tracers={}, skeleton={}, arrows={} }
+local renderSteppedConn, playerAddedConn, playerRemovingConn, hotkeyConn
+local isUnloaded, lastFullUpdate, lastSkeletonUpdate, lastTextUpdate, lastArrowUpdate = false, 0, 0, 0, 0
+local fpsSum, fpsCount, currentFPS = 0, 0, 60
+local fpsLabel, drawCountLabel, frameTimeLabel
+local fovDraw = Drawing.new("Circle")
+fovDraw.Visible = false
+fovDraw.NumSides = 60
+local squareFOV = Drawing.new("Quad")
+squareFOV.Visible = false
+squareFOV.Thickness = 2
+local rayParams, aimRayParams = RaycastParams.new(), RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.FilterDescendantsInstances = { Camera }
+aimRayParams.FilterType = Enum.RaycastFilterType.Exclude
+local visibleCheckExclude = { Camera }
+
+local predictionCache = {}
+local threatScoreCache = {}
+local lastPredictionUpdate = 0
+local lastFrameTime = os.clock()
+local lastDrawCountUpdate = 0
+local drawCountValue = 0
+local frameDurations = {}
+local cachedCameraCFrame = CFrame.new()
+local cachedCameraPosition = Vector3.new()
+
+local autoFireThread = nil
+local autoFireLock = false
+local hookRecoveryTimer = 0
+local silentHooksActive = false
+
+-- ===== ОБЪЯВЛЕНИЕ ФУНКЦИЙ С ПРАВИЛЬНЫМ ПОРЯДКОМ =====
+
+local updateESPSync = nil
+local updateFrameTimeProfiler = nil
+local unloadHub = nil
+
+-- ===== ФУНКЦИЯ ДЛЯ HUMANIZE =====
+local function getHumanizedFactor(dt)
+    local osc = Config.Aimbot.HumanizeOscillation or 2.5
+    local freq = Config.Aimbot.HumanizeFrequency or 1.2
+    local amplitude = 0.7 + 0.3 * math.sin(os.clock() * freq + math.random() * 0.1)
+    amplitude = amplitude * (1 + (osc - 2.5) * 0.05)
+    return math.clamp(Config.Aimbot.Smoothness * dt * 60 * amplitude, 0.05, 0.8)
+end
+
+-- ===== ФУНКЦИЯ cachePlayerParts =====
+local function cachePlayerParts(plr, char)
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local head = char:FindFirstChild("Head")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local parts = {
+        _player = plr,
+        Character = char,
+        humanoid = hum,
+        Head = head,
+        HumanoidRootPart = hrp,
+        CanQueryCache = { Head = head and head.CanQuery or true, HRP = hrp and hrp.CanQuery or true },
+        Torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso"),
+    }
+    parts.LeftArm = char:FindFirstChild("LeftArm") or char:FindFirstChild("LeftUpperArm")
+    parts.LeftLowerArm = char:FindFirstChild("LeftLowerArm")
+    parts.LeftHand = char:FindFirstChild("LeftHand")
+    parts.RightArm = char:FindFirstChild("RightArm") or char:FindFirstChild("RightUpperArm")
+    parts.RightLowerArm = char:FindFirstChild("RightLowerArm")
+    parts.RightHand = char:FindFirstChild("RightHand")
+    parts.LeftLeg = char:FindFirstChild("LeftLeg") or char:FindFirstChild("LeftUpperLeg")
+    parts.LeftLowerLeg = char:FindFirstChild("LeftLowerLeg")
+    parts.LeftFoot = char:FindFirstChild("LeftFoot")
+    parts.RightLeg = char:FindFirstChild("RightLeg") or char:FindFirstChild("RightUpperLeg")
+    parts.RightLowerLeg = char:FindFirstChild("RightLowerLeg")
+    parts.RightFoot = char:FindFirstChild("RightFoot")
+    
+    local existing = playersData[plr]
+    if existing then
+        parts._drawings = existing.drawings
+        parts._skeletonLines = existing.skeletonLines
+        parts._texts = existing.texts
+        parts._tracer = existing.tracer
+        parts._arrow = existing.arrow
+        parts._highlight = existing.highlight
+        parts._adornment = existing.adornment
+    end
+    
+    if existing then
+        existing.parts = parts
+        existing.drawings = parts._drawings
+        existing.skeletonLines = parts._skeletonLines
+        existing.texts = parts._texts
+        existing.tracer = parts._tracer
+        existing.arrow = parts._arrow
+        existing.highlight = parts._highlight
+        existing.adornment = parts._adornment
+    else
+        playersData[plr] = {parts = parts}
+    end
+end
+
+-- ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ESP =====
+local function removeFromPool(pool, obj)
+    for i,v in ipairs(pool) do
+        if v == obj then
+            table.remove(pool, i)
+            break
+        end
+    end
+end
+
+local function getFromPool(pool, type)
+    for i,obj in ipairs(pool) do
+        if obj and obj.Visible == false then
+            return obj
+        end
+    end
+    local new = Drawing.new(type)
+    table.insert(pool, new)
+    return new
+end
+
+local function hideAll(d)
+    if not d then return end
+    if d.drawings then
+        for _,g in pairs(d.drawings) do
+            if type(g) == "table" then
+                for _,o in pairs(g) do
+                    if o then o.Visible = false end
+                end
+            elseif g then
+                g.Visible = false
+            end
+        end
+    end
+    if d.skeletonLines then
+        for _,l in pairs(d.skeletonLines) do
+            if l then l.Visible = false end
+        end
+    end
+    if d.texts then
+        for _,t in pairs(d.texts) do
+            if t then t.Visible = false end
+        end
+    end
+    if d.tracer then
+        d.tracer.Visible = false
+    end
+    if d.adornment then
+        d.adornment.Visible = false
+    end
+    if d.arrow then
+        for _,a in pairs(d.arrow) do
+            if a then a.Visible = false end
+        end
+    end
+    if d.highlight then
+        d.highlight.Enabled = false
+    end
+end
+
+local function destroyAll(d)
+    if not d then return end
+    if d.drawings then
+        for _,g in pairs(d.drawings) do
+            if type(g) == "table" then
+                for _,o in pairs(g) do
+                    safeDestroy(o)
+                    removeFromPool(drawingPool.lines, o)
+                    removeFromPool(drawingPool.corners, o)
+                end
+            else
+                safeDestroy(g)
+                removeFromPool(drawingPool.lines, g)
+            end
+        end
+        d.drawings = nil
+    end
+    if d.skeletonLines then
+        for _,l in pairs(d.skeletonLines) do
+            safeDestroy(l)
+            removeFromPool(drawingPool.skeleton, l)
+        end
+        d.skeletonLines = nil
+    end
+    if d.texts then
+        for _,t in pairs(d.texts) do
+            safeDestroy(t)
+            removeFromPool(drawingPool.texts, t)
+        end
+        d.texts = nil
+    end
+    if d.tracer then
+        safeDestroy(d.tracer)
+        removeFromPool(drawingPool.tracers, d.tracer)
+        d.tracer = nil
+    end
+    if d.adornment then
+        safeDestroy(d.adornment)
+        d.adornment = nil
+    end
+    if d.arrow then
+        for _,a in pairs(d.arrow) do
+            safeDestroy(a)
+            removeFromPool(drawingPool.arrows, a)
+        end
+        d.arrow = nil
+    end
+    if d.highlight then
+        safeDestroy(d.highlight)
+        d.highlight = nil
+    end
+end
+
+local function isTeammate(plr)
+    if LP.Team and plr.Team and LP.Team == plr.Team then return true end
+    local myTeam = LP:GetAttribute("Team")
+    local theirTeam = plr:GetAttribute("Team")
+    if myTeam and theirTeam and myTeam == theirTeam then return true end
+    local myLs = LP:FindFirstChild("leaderstats")
+    local theirLs = plr:FindFirstChild("leaderstats")
+    if myLs and theirLs then
+        local myT = myLs:FindFirstChild("Team")
+        local theirT = theirLs:FindFirstChild("Team")
+        if myT and theirT and myT.Value == theirT.Value then return true end
+    end
+    return false
+end
+
+local function setupPlayer(plr)
+    if plr == LP then return end
+    if playersData[plr] then hideAll(playersData[plr]) end
+    if connections[plr] then
+        for _,c in pairs(connections[plr]) do
+            if c then c:Disconnect() end
+        end
+    end
+    playersData[plr] = {parts={}, drawings=nil, skeletonLines=nil, texts=nil, tracer=nil, adornment=nil, arrow=nil, highlight=nil, visible=false, lastVisibleUpdate=0}
+    renderData[plr] = nil
+    connections[plr] = {}
+
+    local ca = plr.CharacterAdded:Connect(function(char)
+        task.spawn(function()
+            if LP.Character then
+                rayParams.FilterDescendantsInstances = {LP.Character, Camera}
+            end
+            local hrp = char:WaitForChild("HumanoidRootPart", 5)
+            local head = char:WaitForChild("Head", 5)
+            if hrp and head and char.Parent then
+                cachePlayerParts(plr, char)
+                local d = playersData[plr]
+                if d then
+                    if d.highlight then
+                        safeDestroy(d.highlight)
+                        d.highlight = nil
+                    end
+                    if Config.ESP.Chams then
+                        local hl = Instance.new("Highlight")
+                        hl.Name = "GlupostESPHighlight"
+                        hl.FillColor = Config.ESP.ChamsVisibleColor
+                        hl.OutlineColor = Config.ESP.ChamsOccludedColor
+                        hl.FillTransparency = Config.ESP.ChamsTransparency
+                        hl.Parent = char
+                        d.highlight = hl
+                    end
+                end
+            end
+        end)
+    end)
+
+    local cr = plr.CharacterRemoving:Connect(function()
+        if currentTarget and currentTarget.Parent then
+            local targetPlr = Players:GetPlayerFromCharacter(currentTarget.Parent)
+            if targetPlr == plr then
+                currentTarget = nil
+                lockedTarget = nil
+            end
+        end
+        if playersData[plr] then
+            if playersData[plr].highlight then
+                safeDestroy(playersData[plr].highlight)
+                playersData[plr].highlight = nil
+            end
+            hideAll(playersData[plr])
+        end
+        predictionCache[plr] = nil
+        threatScoreCache[plr] = nil
+    end)
+    connections[plr].CharacterAdded = ca
+    connections[plr].CharacterRemoving = cr
+    if plr.Character then
+        cachePlayerParts(plr, plr.Character)
+    end
+end
+
+local function getBoxColor(plr, visible, priority)
+    if priority then return Config.ESP.PriorityColor end
+    if Config.ESP.VisibleCheck then
+        return visible and Config.ESP.VisibleColor or Config.ESP.OccludedColor
+    else
+        if Config.ESP.HideTeammates and isTeammate(plr) then
+            return Config.ESP.AllyColor
+        else
+            return Config.ESP.EnemyColor
+        end
+    end
+end
+
+local function isVisibleCached(data, part)
+    local now = os.clock()
+    if now - data.lastVisibleUpdate < CONST.VISIBLE_UPDATE_INTERVAL then
+        return data.visible
+    end
+    data.lastVisibleUpdate = now
+    if not part then
+        data.visible = false
+        return false
+    end
+    local origin = cachedCameraPosition
+    local delta = part.Position - origin
+    local mag = delta.Magnitude
+    if mag < 0.001 then
+        data.visible = true
+        return true
+    end
+    local dir = delta / mag
+    if LP.Character then
+        table.clear(visibleCheckExclude)
+        table.insert(visibleCheckExclude, Camera)
+        table.insert(visibleCheckExclude, LP.Character)
+    end
+    rayParams.FilterDescendantsInstances = visibleCheckExclude
+    local res = workspace:Raycast(origin, dir * mag, rayParams)
+    if not res then
+        data.visible = true
+        return true
+    end
+    data.visible = (res.Position - origin).Magnitude >= mag - 0.5
+    return data.visible
+end
+
+-- ===== ESP ОТРИСОВКА =====
+local function updateBoxPosition(d, parts, rd)
+    if rd.distance > Config.ESP.MaxDistance or rd.distance < Config.ESP.MinDistance or not rd.onScreen then
+        if d.drawings then
+            if d.drawings.lines then
+                for _,l in pairs(d.drawings.lines) do
+                    l.Visible = false
+                end
+            end
+            if d.drawings.corners then
+                for _,c in pairs(d.drawings.corners) do
+                    c.Visible = false
+                end
+            end
+        end
+        return false
+    end
+
+    local head = parts.Head
+    local hrp = parts.HumanoidRootPart
+    if not head or not hrp or not isPartValid(hrp) or not isPartValid(head) then
+        return false
+    end
+
+    local headPos3D, headOnScreen = Camera:WorldToScreenPoint(head.Position + Vector3.new(0, 0.5, 0))
+    local legPos3D, legOnScreen = Camera:WorldToScreenPoint(hrp.Position - Vector3.new(0, 3, 0))
+
+    local headPos = Vector2.new(headPos3D.X, headPos3D.Y)
+    local legPos = Vector2.new(legPos3D.X, legPos3D.Y)
+
+    local height = math.abs(headPos.Y - legPos.Y)
+    if height < 2 then return false end
+
+    local width = height * 0.8
+    local left = rd.hrpPos.X - width / 2
+    local top = headPos.Y
+    local right = left + width
+    local bottom = top + height
+    local color = getBoxColor(parts._player, rd.visible, rd.priority)
+
+    if Config.ESP.BoxType == "2D" then
+        if not d.drawings then d.drawings = {} end
+        local lines = d.drawings.lines
+        if not lines then
+            lines = {}
+            for i = 1, 4 do
+                lines[i] = getFromPool(drawingPool.lines, "Line")
+            end
+            d.drawings.lines = lines
+        end
+
+        lines[1].From = Vector2.new(left, top)
+        lines[1].To = Vector2.new(right, top)
+        lines[2].From = Vector2.new(right, top)
+        lines[2].To = Vector2.new(right, bottom)
+        lines[3].From = Vector2.new(right, bottom)
+        lines[3].To = Vector2.new(left, bottom)
+        lines[4].From = Vector2.new(left, bottom)
+        lines[4].To = Vector2.new(left, top)
+
+        for i = 1, 4 do
+            lines[i].Color = color
+            lines[i].Thickness = rd.priority and Config.ESP.BoxThickness + 2 or Config.ESP.BoxThickness
+            lines[i].Visible = true
+        end
+        if d.drawings.corners then
+            for _,c in pairs(d.drawings.corners) do
+                c.Visible = false
+            end
+        end
+    elseif Config.ESP.BoxType == "Corner" then
+        if not d.drawings then d.drawings = {} end
+        local corners = d.drawings.corners
+        if not corners then
+            corners = {}
+            for i = 1, 8 do
+                corners[i] = getFromPool(drawingPool.corners, "Line")
+            end
+            d.drawings.corners = corners
+        end
+        local len = 12
+        corners[1].From = Vector2.new(left, top)
+        corners[1].To = Vector2.new(left + len, top)
+        corners[2].From = Vector2.new(left, top)
+        corners[2].To = Vector2.new(left, top + len)
+        corners[3].From = Vector2.new(right, top)
+        corners[3].To = Vector2.new(right - len, top)
+        corners[4].From = Vector2.new(right, top)
+        corners[4].To = Vector2.new(right, top + len)
+        corners[5].From = Vector2.new(left, bottom)
+        corners[5].To = Vector2.new(left + len, bottom)
+        corners[6].From = Vector2.new(left, bottom)
+        corners[6].To = Vector2.new(left, bottom - len)
+        corners[7].From = Vector2.new(right, bottom)
+        corners[7].To = Vector2.new(right - len, bottom)
+        corners[8].From = Vector2.new(right, bottom)
+        corners[8].To = Vector2.new(right, bottom - len)
+        for i = 1, 8 do
+            corners[i].Color = color
+            corners[i].Thickness = rd.priority and Config.ESP.BoxThickness + 2 or Config.ESP.BoxThickness
+            corners[i].Visible = true
+        end
+        if d.drawings.lines then
+            for _,l in pairs(d.drawings.lines) do
+                l.Visible = false
+            end
+        end
+    elseif Config.ESP.BoxType == "3D" then
+        if d.drawings then
+            if d.drawings.lines then
+                for _,l in pairs(d.drawings.lines) do
+                    l.Visible = false
+                end
+            end
+            if d.drawings.corners then
+                for _,c in pairs(d.drawings.corners) do
+                    c.Visible = false
+                end
+            end
+        end
+        if not Config.ESP.Chams then
+            if not d.adornment then
+                d.adornment = Instance.new("BoxHandleAdornment")
+                d.adornment.AlwaysOnTop = true
+                d.adornment.Transparency = 0.5
+                d.adornment.ZIndex = 0
+                d.adornment.Parent = hrp
+            end
+            d.adornment.Adornee = hrp
+            d.adornment.Size = hrp.Size + Vector3.new(2, 3, 2)
+            d.adornment.Color = color
+            d.adornment.Visible = true
+        else
+            if d.adornment then
+                d.adornment.Visible = false
+            end
+        end
+    end
+    return true
+end
+
+local function updateSkeletonOptimized(d, parts, rd)
+    if not Config.ESP.Skeleton then
+        if d.skeletonLines then
+            for _,l in pairs(d.skeletonLines) do
+                if l then l.Visible = false end
+            end
+        end
+        return
+    end
+    local plr = parts._player
+    if plr and plr.Character and (not parts.LeftLowerArm or not parts.RightLowerArm or not parts.LeftLowerLeg or not parts.RightLowerLeg) then
+        cachePlayerParts(plr, plr.Character)
+        parts = playersData[plr].parts
+        if not parts then return end
+    end
+    local function getPos(part)
+        if part and isPartValid(part) then
+            local pos3D, onScreen = Camera:WorldToScreenPoint(part.Position)
+            if onScreen then
+                return Vector2.new(pos3D.X, pos3D.Y)
+            end
+        end
+        return nil
+    end
+    local conns = {
+        {parts.Head, parts.Torso},
+        {parts.Torso, parts.HumanoidRootPart},
+        {parts.Torso, parts.LeftArm},
+        {parts.Torso, parts.RightArm},
+        {parts.LeftArm, parts.LeftLowerArm},
+        {parts.RightArm, parts.RightLowerArm},
+        {parts.LeftLowerArm, parts.LeftHand},
+        {parts.RightLowerArm, parts.RightHand},
+        {parts.Torso, parts.LeftLeg},
+        {parts.Torso, parts.RightLeg},
+        {parts.LeftLeg, parts.LeftLowerLeg},
+        {parts.RightLeg, parts.RightLowerLeg},
+        {parts.LeftLowerLeg, parts.LeftFoot},
+        {parts.RightLowerLeg, parts.RightFoot},
+    }
+    if not d.skeletonLines then
+        d.skeletonLines = {}
+        for i = 1, #conns do
+            d.skeletonLines[i] = getFromPool(drawingPool.skeleton, "Line")
+        end
+    end
+    local idx = 1
+    local color = rd.priority and Config.ESP.PriorityColor or Config.ESP.SkeletonColor
+    for _, c in ipairs(conns) do
+        local a = getPos(c[1])
+        local b = getPos(c[2])
+        if a and b then
+            d.skeletonLines[idx].From = a
+            d.skeletonLines[idx].To = b
+            d.skeletonLines[idx].Color = color
+            d.skeletonLines[idx].Thickness = Config.ESP.SkeletonThickness
+            d.skeletonLines[idx].Visible = true
+        else
+            d.skeletonLines[idx].Visible = false
+        end
+        idx = idx + 1
+    end
+    for i = idx, #d.skeletonLines do
+        if d.skeletonLines[i] then
+            d.skeletonLines[i].Visible = false
+        end
+    end
+end
+
+local function updateTextOptimized(d, parts, rd)
+    if d.texts then
+        for _,t in pairs(d.texts) do
+            if t then t.Visible = false end
+        end
+    end
+    
+    if not Config.ESP.ShowName and not Config.ESP.ShowHealth and not Config.ESP.ShowDistance then
+        return
+    end
+    if rd.distance > Config.ESP.MaxDistance or rd.distance < Config.ESP.MinDistance or not rd.onScreen then
+        return
+    end
+    local head = parts.Head
+    if not head or not isPartValid(head) then
+        return
+    end
+    local headPos3D, onScreen = Camera:WorldToScreenPoint(head.Position + Vector3.new(0, 0.5, 0))
+    if not onScreen then
+        return
+    end
+    local headPos = Vector2.new(headPos3D.X, headPos3D.Y)
+    local hum = parts.humanoid
+    if not hum or hum.Health <= 0 then
+        return
+    end
+    if not d.texts then d.texts = {} end
+    local texts = d.texts
+    local yOff = 0
+    if Config.ESP.ShowName then
+        if not texts.NameText then
+            texts.NameText = getFromPool(drawingPool.texts, "Text")
+            texts.NameText.Center = true
+            texts.NameText.Outline = true
+            texts.NameText.Font = 2
+            texts.NameText.Size = 14
+        end
+        texts.NameText.Position = Vector2.new(rd.hrpPos.X, headPos.Y - 15 - yOff)
+        texts.NameText.Text = parts._player.DisplayName
+        texts.NameText.Color = rd.priority and Config.ESP.PriorityColor or getBoxColor(parts._player, rd.visible, false)
+        texts.NameText.Visible = true
+        yOff = yOff + 16
+    elseif texts.NameText then
+        texts.NameText.Visible = false
+    end
+    if Config.ESP.ShowHealth then
+        if not texts.HealthText then
+            texts.HealthText = getFromPool(drawingPool.texts, "Text")
+            texts.HealthText.Center = true
+            texts.HealthText.Outline = true
+            texts.HealthText.Font = 2
+            texts.HealthText.Size = 12
+        end
+        texts.HealthText.Position = Vector2.new(rd.hrpPos.X, headPos.Y - 15 - yOff)
+        texts.HealthText.Text = "HP " .. math.floor(hum.Health)
+        texts.HealthText.Color = Color3.fromRGB(255, 100, 100)
+        texts.HealthText.Visible = true
+        yOff = yOff + 16
+    elseif texts.HealthText then
+        texts.HealthText.Visible = false
+    end
+    if Config.ESP.ShowDistance then
+        if not texts.DistText then
+            texts.DistText = getFromPool(drawingPool.texts, "Text")
+            texts.DistText.Center = true
+            texts.DistText.Outline = true
+            texts.DistText.Font = 2
+            texts.DistText.Size = 12
+        end
+        texts.DistText.Position = Vector2.new(rd.hrpPos.X, headPos.Y - 15 - yOff)
+        texts.DistText.Text = math.floor(rd.distance) .. " studs"
+        texts.DistText.Color = Color3.fromRGB(200, 200, 200)
+        texts.DistText.Visible = true
+    elseif texts.DistText then
+        texts.DistText.Visible = false
+    end
+end
+
+local function updateArrowOptimized(d, rd)
+    if not Config.ESP.OffscreenArrows then
+        if d.arrow then
+            for _, a in pairs(d.arrow) do
+                a.Visible = false
+            end
+        end
+        return
+    end
+    if rd.onScreen then
+        if d.arrow then
+            for _, a in pairs(d.arrow) do
+                a.Visible = false
+            end
+        end
+        return
+    end
+    local hrp = rd.parts and rd.parts.HumanoidRootPart
+    if not hrp or not isPartValid(hrp) then
+        return
+    end
+    local camCF = cachedCameraCFrame
+    local dir3 = (hrp.Position - camCF.Position).Unit
+    local dir2 = Vector2.new(camCF.RightVector:Dot(dir3), -camCF.UpVector:Dot(dir3))
+    if dir2.Magnitude < 0.001 then return end
+    local dir = dir2.Unit
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local radius = math.min(Camera.ViewportSize.X, Camera.ViewportSize.Y) * 0.4
+    local arrowPos = center + dir * radius
+    arrowPos = Vector2.new(
+        math.clamp(arrowPos.X, Config.ESP.ArrowSize, Camera.ViewportSize.X - Config.ESP.ArrowSize),
+        math.clamp(arrowPos.Y, Config.ESP.ArrowSize, Camera.ViewportSize.Y - Config.ESP.ArrowSize)
+    )
+    if not d.arrow then
+        d.arrow = {
+            getFromPool(drawingPool.arrows, "Line"),
+            getFromPool(drawingPool.arrows, "Line"),
+            getFromPool(drawingPool.arrows, "Line")
+        }
+        for _, a in pairs(d.arrow) do
+            a.Thickness = 2
+        end
+    end
+    local len = Config.ESP.ArrowSize
+    local tip = arrowPos + dir * len
+    local perp = Vector2.new(-dir.Y, dir.X) * (len * 0.4)
+    local color = rd.priority and Config.ESP.PriorityColor or Config.ESP.ArrowColor
+    d.arrow[1].From = tip
+    d.arrow[1].To = arrowPos - dir * len
+    d.arrow[2].From = tip
+    d.arrow[2].To = arrowPos + perp - dir * (len * 0.5)
+    d.arrow[3].From = tip
+    d.arrow[3].To = arrowPos - perp - dir * (len * 0.5)
+    for _, a in pairs(d.arrow) do
+        a.Color = color
+        a.Visible = true
+    end
+end
+
+-- ===== THREAT SCORE & PREDICTION =====
+local function isVisibleThreat(head)
+    if not head then return false end
+    local origin = cachedCameraPosition
+    local dir = head.Position - origin
+    local rayParamsLocal = RaycastParams.new()
+    rayParamsLocal.FilterType = Enum.RaycastFilterType.Exclude
+    rayParamsLocal.FilterDescendantsInstances = { LP.Character }
+    local result = workspace:Raycast(origin, dir, rayParamsLocal)
+    if not result then return true end
+    return result.Instance:IsDescendantOf(head.Parent)
+end
+
+local function calculateThreatScore(plr, parts)
+    local myChar = LP.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    local myPos = myRoot and myRoot.Position or cachedCameraPosition
+
+    local targetHead = parts.Head
+    if not targetHead then return -1000 end
+    local targetRoot = parts.HumanoidRootPart
+    local targetHum = parts.humanoid
+    if not targetRoot or not targetHum or targetHum.Health <= 0 then
+        return -1000
+    end
+
+    local dist = (myPos - targetRoot.Position).Magnitude
+
+    local visible = isVisibleThreat(targetHead)
+    local visNorm = visible and 1 or 0
+
+    local lookNorm = 0
+    if targetHead and myRoot then
+        local lookVector = targetHead.CFrame.LookVector
+        local toMe = (myRoot.Position - targetHead.Position).Unit
+        local dot = lookVector:Dot(toMe)
+        lookNorm = (dot + 1) / 2
+    end
+
+    local maxDist = Config.ESP.MaxDistance
+    local distNorm = 1 - math.clamp(dist / maxDist, 0, 1)
+
+    local health = targetHum.Health
+    local maxHealth = targetHum.MaxHealth
+    if maxHealth <= 0 then maxHealth = 100 end
+    local healthNorm = 1 - health / maxHealth
+
+    local weights = Config.ThreatWeights
+    local score = visNorm * weights.Visibility +
+                  lookNorm * weights.LookAtMe +
+                  distNorm * weights.Distance +
+                  healthNorm * weights.Health
+    threatScoreCache[plr] = score
+    return score
+end
+
+local function updatePredictionCache()
+    local now = os.clock()
+    if now - lastPredictionUpdate < CONST.PREDICTION_CACHE_INTERVAL then
+        return
+    end
+    lastPredictionUpdate = now
+    for plr, data in pairs(playersData) do
+        local parts = data.parts
+        if not parts or not parts.HumanoidRootPart then
+            goto continue
+        end
+        local hrp = parts.HumanoidRootPart
+        if not isPartValid(hrp) then
+            goto continue
+        end
+        local pos = hrp.Position
+        local prev = predictionCache[plr]
+        if prev then
+            local dt = now - prev.time
+            if dt > CONST.PREDICTION_MIN_DT then
+                local newVel = (pos - prev.pos) / dt
+                local newAcc = (newVel - prev.velocity) / dt
+                prev.acceleration = prev.acceleration * 0.5 + newAcc * 0.5
+                prev.velocity = prev.velocity * Config.Aimbot.VelocitySmoothing + newVel * (1 - Config.Aimbot.VelocitySmoothing)
+            end
+            prev.pos = pos
+            prev.time = now
+        else
+            predictionCache[plr] = {
+                pos = pos,
+                velocity = Vector3.zero,
+                acceleration = Vector3.zero,
+                time = now
+            }
+        end
+        ::continue::
+    end
+end
+
+local function getPredictedPosition(targetPart)
+    if not Config.Aimbot.Prediction then
+        return targetPart.Position
+    end
+    local plr = Players:GetPlayerFromCharacter(targetPart.Parent)
+    if not plr then
+        return targetPart.Position
+    end
+    local pred = predictionCache[plr]
+    if not pred then
+        return targetPart.Position
+    end
+    local dt = os.clock() - pred.time
+    if dt > 0.2 then
+        return targetPart.Position
+    end
+    local t = Config.Aimbot.PredictionFactor
+    local base = pred.velocity * t + 0.5 * pred.acceleration * t * t
+    local gravity = CONST.DEFAULT_GRAVITY * (Config.Aimbot.GravityFactor or 1.0)
+    base = base - Vector3.new(0, 0.5 * gravity * t * t, 0)
+    return targetPart.Position + base
+end
+
+-- ===== SILENT AIM =====
+local oldNamecall, oldIndex
+local ourSilentHook = {}
+
+local function getRandomBone(character)
+    if not character then return nil end
+    if not Config.Aimbot.RandomBone then return nil end
+    local weights = Config.Aimbot.BoneWeights
+    local plr = Players:GetPlayerFromCharacter(character)
+    if not plr or not playersData[plr] then return nil end
+    local parts = playersData[plr].parts
+    local candidates = {}
+    local totalWeight = 0
+    for boneName, weight in pairs(weights) do
+        local part = parts[boneName]
+        if part and isPartValid(part) then
+            table.insert(candidates, {part = part, weight = weight})
+            totalWeight = totalWeight + weight
+        end
+    end
+    if #candidates == 0 then return nil end
+    local r = math.random() * totalWeight
+    local sum = 0
+    for _, candidate in ipairs(candidates) do
+        sum = sum + candidate.weight
+        if r <= sum then
+            return candidate.part
+        end
+    end
+    return candidates[#candidates].part
+end
+
+local function initSilentAimbot()
+    if silentHooksActive then return end
+    
+    local namecallHook = function(self, ...)
+        local args = {...}
+        local success, isEngineCall = pcall(function()
+            return checkcaller()
+        end)
+        if success and isEngineCall then
+            return oldNamecall(self, ...)
+        end
+
+        local method = getnamecallmethod()
+        if Config.Aimbot.SilentEnabled and Config.Aimbot.Enabled and not isUnloaded then
+            if (method == "Raycast" or method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList") and self == workspace then
+                if currentTarget and UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+                    local targetPos = currentTarget.Position
+                    local lookVector = cachedCameraCFrame.LookVector
+                    local dirToTarget = (targetPos - cachedCameraCFrame.Position).Unit
+                    local angle = math.acos(math.clamp(lookVector:Dot(dirToTarget), -1, 1))
+                    if math.deg(angle) > Config.Aimbot.SilentMaxAngle then
+                        return oldNamecall(self, ...)
+                    end
+
+                    if math.random(1,100) <= Config.Aimbot.HitChance then
+                        local ray = Camera:ViewportPointToRay(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+                        local effectiveTarget = currentTarget
+                        if Config.Aimbot.RandomBone then
+                            local randomPart = getRandomBone(effectiveTarget.Parent)
+                            if randomPart then
+                                effectiveTarget = randomPart
+                            end
+                        end
+                        
+                        local jitter
+                        if RageActive and RageConfig.RageFeatures.MultiPoint then
+                            jitter = Vector3.new(
+                                (math.random() - 0.5) * 2 * RageConfig.RageFeatures.MultiPointSpread,
+                                (math.random() - 0.5) * 2 * RageConfig.RageFeatures.MultiPointSpread,
+                                (math.random() - 0.5) * 2 * RageConfig.RageFeatures.MultiPointSpread
+                            )
+                        else
+                            jitter = jitterOffset()
+                        end
+                        
+                        local adjTarget = effectiveTarget.Position + jitter
+                        if Config.Aimbot.RCSEnabled and Config.Aimbot.RCSAdaptiveLearning then
+                            adjTarget = applyAdaptiveRCS(adjTarget)
+                        end
+                        local direction = (adjTarget - ray.Origin).Unit * CONST.SILENT_RAY_LENGTH
+
+                        if method == "Raycast" and typeof(ray.Origin) == "Vector3" then
+                            return oldNamecall(self, ray.Origin, direction, unpack(args, 3))
+                        elseif method ~= "Raycast" then
+                            local oldRay = args[1]
+                            if oldRay then
+                                args[1] = Ray.new(oldRay.Origin, (adjTarget - oldRay.Origin).Unit * CONST.SILENT_RAY_LENGTH)
+                                return oldNamecall(self, unpack(args))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return oldNamecall(self, ...)
+    end
+
+    local indexHook = function(self, key)
+        if Config.Aimbot.SilentEnabled and Config.Aimbot.Enabled and not isUnloaded and not UIS:GetFocusedTextBox() then
+            if typeof(self) == "Instance" and self:IsA("Mouse") then
+                if (key == "Hit" or key == "Target") and UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+                    if currentTarget and math.random(1,100) <= Config.Aimbot.HitChance then
+                        local adjTarget = currentTarget.Position
+                        if Config.Aimbot.RandomBone then
+                            local randomPart = getRandomBone(currentTarget.Parent)
+                            if randomPart then
+                                adjTarget = randomPart.Position
+                            end
+                        end
+                        if Config.Aimbot.RCSEnabled and Config.Aimbot.RCSAdaptiveLearning then
+                            adjTarget = applyAdaptiveRCS(adjTarget)
+                        end
+                        if key == "Hit" then
+                            return CFrame.new(adjTarget)
+                        else
+                            return currentTarget
+                        end
+                    end
+                end
+            end
+        end
+        return oldIndex(self, key)
+    end
+
+    if hookmetamethod then
+        oldNamecall = hookmetamethod(game, "__namecall", namecallHook)
+        oldIndex = hookmetamethod(game, "__index", indexHook)
+    else
+        local gmt = getrawmetatable(game)
+        if gmt then
+            oldNamecall = gmt.__namecall
+            oldIndex = gmt.__index
+            setreadonly(gmt, false)
+            gmt.__namecall = namecallHook
+            gmt.__index = indexHook
+            setreadonly(gmt, true)
+        end
+    end
+    ourSilentHook = { namecall = namecallHook, index = indexHook }
+    silentHooksActive = true
+end
+
+local function removeSilentHook()
+    if not ourSilentHook.namecall then return end
+    if hookmetamethod then
+        pcall(function()
+            hookmetamethod(game, "__namecall", oldNamecall)
+        end)
+        pcall(function()
+            hookmetamethod(game, "__index", oldIndex)
+        end)
+    else
+        local gmt = getrawmetatable(game)
+        if gmt then
+            setreadonly(gmt, false)
+            if gmt.__namecall == ourSilentHook.namecall then
+                gmt.__namecall = oldNamecall
+            end
+            if gmt.__index == ourSilentHook.index then
+                gmt.__index = oldIndex
+            end
+            setreadonly(gmt, true)
+        end
+    end
+    ourSilentHook = {}
+    silentHooksActive = false
+end
+
+local function recoverHooks()
+    if not silentHooksActive then
+        initSilentAimbot()
+    end
+end
+
+-- ===== СГЛАЖИВАНИЕ =====
+local function applySmoothing(currentCF, targetCF, targetPart, dt)
+    local smoothType = Config.Aimbot.SmoothnessType
+    
+    if not Config.Aimbot.Humanize and smoothType == "HumanLike" then
+        smoothType = "Linear"
+    end
+    
+    if smoothType == "Instant" then
+        return targetCF
+    end
+
+    local angle = math.acos(math.clamp(currentCF.LookVector:Dot(targetCF.LookVector), -1, 1))
+    if angle > math.rad(CONST.ANGLE_SAFETY_DEG) then
+        return currentCF
+    end
+
+    local t = Config.Aimbot.Smoothness
+    local fpsFactor = math.clamp(dt * 60, 0.1, 2.0)
+
+    if smoothType == "Linear" then
+        return currentCF:Lerp(targetCF, math.clamp(t * fpsFactor, 0.01, 0.99))
+    elseif smoothType == "Easing" then
+        local eased = 1 - math.pow(1 - (t * fpsFactor), 3)
+        return currentCF:Lerp(targetCF, math.clamp(eased, 0.01, 0.99))
+    elseif smoothType == "HumanLike" then
+        local factor = getHumanizedFactor(dt)
+        return currentCF:Lerp(targetCF, math.clamp(factor, 0.05, 0.8))
+    end
+    return targetCF
+end
+
+-- ===== DYNAMIC FOV =====
+local function getDynamicFOVRadius()
+    local baseRadius = Config.Aimbot.FOVRadius
+    if not Config.Aimbot.DynamicFOV then
+        return baseRadius
+    end
+    local mouseDelta = UIS:GetMouseDelta()
+    local mouseSpeed = mouseDelta.Magnitude
+    local char = LP.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    local moveSpeed = humanoid and humanoid.MoveDirection.Magnitude or 0
+    local factor = math.sqrt(
+        mouseSpeed * CONST.DYNAMIC_FOV_MOUSE_FACTOR +
+        moveSpeed * CONST.DYNAMIC_FOV_MOVE_FACTOR
+    )
+    return baseRadius + math.clamp(factor * 15, 0, CONST.DYNAMIC_FOV_MAX_INCREASE)
+end
+
+local function updateFOV()
+    if not Config.Aimbot.ShowFOV then
+        fovDraw.Visible = false
+        squareFOV.Visible = false
+        return
+    end
+    local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+    local radius = getDynamicFOVRadius()
+    local color = Config.Aimbot.FOVColor
+    local thickness = Config.Aimbot.FOVThickness
+    if Config.Aimbot.FOVShape == "Circle" then
+        fovDraw.Position = center
+        fovDraw.Radius = radius
+        fovDraw.Color = color
+        fovDraw.Thickness = thickness
+        fovDraw.Filled = Config.Aimbot.FilledFOV
+        fovDraw.Transparency = Config.Aimbot.FOVTransparency
+        fovDraw.Visible = true
+        squareFOV.Visible = false
+    else
+        local left = center.X - radius
+        local top = center.Y - radius
+        local right = center.X + radius
+        local bottom = center.Y + radius
+        squareFOV.PointA = Vector2.new(left, top)
+        squareFOV.PointB = Vector2.new(right, top)
+        squareFOV.PointC = Vector2.new(right, bottom)
+        squareFOV.PointD = Vector2.new(left, bottom)
+        squareFOV.Color = color
+        squareFOV.Thickness = thickness
+        squareFOV.Filled = false
+        squareFOV.Transparency = Config.Aimbot.FOVTransparency
+        squareFOV.Visible = true
+        fovDraw.Visible = false
+    end
+end
+
+-- ===== GET BEST TARGET =====
+local function getBestTarget()
+    local bestTarget = nil
+    local bestScore = -math.huge
+    local maxDist = Config.ESP.MaxDistance
+    local fovRadius = getDynamicFOVRadius()
+    local wallCheck = Config.Aimbot.WallCheck
+
+    for plr, data in pairs(playersData) do
+        if not data.parts then
+            goto continue
+        end
+        local parts = data.parts
+        if Config.Aimbot.TeamCheck and isTeammate(plr) then
+            goto continue
+        end
+        if Config.ESP.HideTeammates and isTeammate(plr) then
+            goto continue
+        end
+        local targetPart = parts[Config.Aimbot.TargetPart]
+        if not targetPart or not isPartValid(targetPart) then
+            goto continue
+        end
+        local hum = parts.humanoid
+        if not hum or hum.Health <= 0 then
+            goto continue
+        end
+        local predictedPos = getPredictedPosition(targetPart)
+        local distanceStuds = (cachedCameraCFrame.Position - predictedPos).Magnitude
+        if distanceStuds > maxDist then
+            goto continue
+        end
+        local screenPos, onScreen = Camera:WorldToViewportPoint(predictedPos)
+        if not onScreen then
+            goto continue
+        end
+        local distPixels = (Vector2.new(screenPos.X, screenPos.Y) -
+                           Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)).Magnitude
+        if distPixels > fovRadius then
+            goto continue
+        end
+        if wallCheck then
+            if not parts.Character then
+                goto continue
+            end
+            local origin = cachedCameraCFrame.Position
+            local dir = predictedPos - origin
+            aimRayParams.FilterDescendantsInstances = { Camera, LP.Character, parts.Character }
+            if workspace:Raycast(origin, dir, aimRayParams) then
+                goto continue
+            end
+        end
+        local score = 0
+        if Config.Aimbot.PriorityMode == "Threat" then
+            score = calculateThreatScore(plr, parts)
+        elseif Config.Aimbot.PriorityMode == "Distance" then
+            score = -distanceStuds
+        elseif Config.Aimbot.PriorityMode == "Crosshair" then
+            score = -distPixels
+        elseif Config.Aimbot.PriorityMode == "Health" then
+            score = -hum.Health
+        elseif Config.Aimbot.PriorityMode == "Visible" then
+            local visible = isVisibleCached(data, parts.Head)
+            score = (visible and 500 or 0) - distanceStuds * 0.5
+        end
+        if score > bestScore then
+            bestScore = score
+            bestTarget = targetPart
+        end
+        ::continue::
+    end
+    return bestTarget
+end
+
+-- ===== KILL AURA =====
+local function updateKillAuraCache()
+    if not RageActive or not RageConfig.RageFeatures.Enabled or not RageConfig.RageMasterSwitch then
+        killAuraTargetsCache = {}
+        return
+    end
+    local now = os.clock()
+    if now - killAuraLastUpdate < CONST.KILL_AURA_CYCLE_DELAY then
+        return
+    end
+    killAuraLastUpdate = now
+    killAuraTargetsCache = {}
+    local char = LP.Character
+    if not char then
+        return
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp or not isPartValid(hrp) then
+        return
+    end
+    local myPos = hrp.Position
+    local radius = RageConfig.RageFeatures.KillAuraRadius
+
+    for plr, data in pairs(playersData) do
+        if plr == LP then
+            goto continue
+        end
+        local parts = data.parts
+        if not parts then
+            goto continue
+        end
+        local targetPart = parts[Config.Aimbot.TargetPart]
+        if not targetPart or not isPartValid(targetPart) then
+            goto continue
+        end
+        local hum = parts.humanoid
+        if not hum or hum.Health <= 0 then
+            goto continue
+        end
+        local dist = (myPos - targetPart.Position).Magnitude
+        if dist <= radius then
+            if Config.Aimbot.TeamCheck and isTeammate(plr) then
+                goto continue
+            end
+            local doWallCheck = Config.Aimbot.WallCheck and not RageConfig.RageFeatures.AutoWall
+            if doWallCheck then
+                if not parts.Character then
+                    goto continue
+                end
+                local origin = cachedCameraCFrame.Position
+                local dir = targetPart.Position - origin
+                aimRayParams.FilterDescendantsInstances = { Camera, LP.Character, parts.Character }
+                if workspace:Raycast(origin, dir, aimRayParams) then
+                    goto continue
+                end
+            end
+            table.insert(killAuraTargetsCache, targetPart)
+        end
+        ::continue::
+    end
+    killAuraIndex = 1
+end
+
+local function getKillAuraTarget()
+    if #killAuraTargetsCache == 0 then
+        return nil
+    end
+    if not killAuraIndex or killAuraIndex > #killAuraTargetsCache then
+        killAuraIndex = 1
+    end
+    local target = killAuraTargetsCache[killAuraIndex]
+    killAuraIndex = killAuraIndex + 1
+    return target
+end
+
+-- ===== ГЛАВНЫЙ ЦИКЛ =====
+local aimActive = false
+local aimKeyPressedTime = 0
+local lastAutoFireShot = 0
+
+local function startAutoFireLoop()
+    if autoFireLock then return end
+    autoFireLock = true
+    if autoFireThread then
+        task.cancel(autoFireThread)
+    end
+    autoFireThread = task.spawn(function()
+        while not isUnloaded and RageActive and RageConfig.RageFeatures.Enabled and RageConfig.RageMasterSwitch and
+              (RageConfig.RageFeatures.AutoFire or RageConfig.RageFeatures.RapidFire) do
+            if currentTarget then
+                local minCd, maxCd
+                if RageConfig.RageFeatures.RapidFire then
+                    minCd = CONST.RAPID_FIRE_MIN_COOLDOWN
+                    maxCd = CONST.RAPID_FIRE_MAX_COOLDOWN
+                else
+                    minCd = CONST.AUTO_FIRE_MIN_COOLDOWN
+                    maxCd = CONST.AUTO_FIRE_MAX_COOLDOWN
+                end
+                local cooldown = getRandomDelay(minCd, maxCd)
+                local now = os.clock()
+                if now - lastAutoFireShot >= cooldown then
+                    if math.random(1,100) <= Config.Aimbot.HitChance then
+                        if mouse1press and mouse1release then
+                            mouse1press()
+                            local waitTime = getRandomDelay(0.005, 0.02)
+                            task.wait(waitTime)
+                            mouse1release()
+                            if RageConfig.RageFeatures.DoubleTap then
+                                task.wait(RageConfig.RageFeatures.DTDelay)
+                                mouse1press()
+                                task.wait(waitTime)
+                                mouse1release()
+                            end
+                        end
+                    end
+                    lastAutoFireShot = now
+                    recordRecoilStart()
+                end
+            end
+            task.wait(0.001)
+        end
+        autoFireThread = nil
+        autoFireLock = false
+    end)
+end
+
+local function stopAutoFireLoop()
+    if autoFireThread then
+        task.cancel(autoFireThread)
+        autoFireThread = nil
+    end
+    autoFireLock = false
+end
+
+-- ОПРЕДЕЛЕНИЕ updateAntiAim (объявлено заранее)
+local updateAntiAim = nil
+
+local function updateAimbotLoop(dt)
+    if isUnloaded then
+        return
+    end
+    if not Config.Aimbot.Enabled then
+        return
+    end
+
+    local myChar = LP.Character
+    local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHrp then
+        aimActive = false
+        currentTarget = nil
+        lockedTarget = nil
+        if currentRecoilPattern then
+            currentRecoilPattern = nil
+        end
+        return
+    end
+
+    if currentRecoilPattern then
+        recordRecoilUpdate()
+    end
+    if RageActive and updateAntiAim then
+        updateAntiAim(dt)
+    end
+
+    local rageActiveNow = RageActive and RageConfig.RageFeatures.Enabled and RageConfig.RageMasterSwitch
+
+    if rageActiveNow and RageConfig.RageFeatures.TeleportKill and myHrp then
+        if UIS:IsKeyDown(RageConfig.RageFeatures.TeleportKey) and currentTarget then
+            local targetPos = currentTarget.Position
+            myHrp.CFrame = CFrame.new(targetPos + (myHrp.CFrame.LookVector * -5))
+        end
+    end
+
+    local pressed = false
+    if rageActiveNow and RageConfig.RageFeatures.Triggerbot then
+        pressed = true
+    else
+        local key = Config.Aimbot.AimbotKey
+        if key.EnumType == Enum.UserInputType then
+            pressed = UIS:IsMouseButtonPressed(key)
+        elseif key.EnumType == Enum.KeyCode then
+            pressed = UIS:IsKeyDown(key)
+        end
+    end
+
+    if pressed and myHrp then
+        if not aimActive then
+            if aimKeyPressedTime == 0 then
+                aimKeyPressedTime = os.clock()
+            end
+            if os.clock() - aimKeyPressedTime >= Config.Aimbot.ReactionTime then
+                aimActive = true
+            end
+        end
+    else
+        aimActive = false
+        aimKeyPressedTime = 0
+    end
+
+    local newTarget = nil
+    if (aimActive or (rageActiveNow and RageConfig.RageFeatures.AutoFire) or
+        (rageActiveNow and RageConfig.RageFeatures.KillAura)) and myHrp then
+        if rageActiveNow and RageConfig.RageFeatures.KillAura then
+            newTarget = getKillAuraTarget()
+        elseif aimActive then
+            newTarget = getBestTarget()
+        end
+    end
+
+    if newTarget then
+        targetLoseTimer = 0
+        if not RageActive and Config.Aimbot.TargetSwitchDelay > 0 and lockedTarget then
+            if newTarget ~= lockedTarget then
+                if os.clock() - lastTargetSwitch < Config.Aimbot.TargetSwitchDelay then
+                    newTarget = lockedTarget
+                else
+                    lockedTarget = newTarget
+                    lastTargetSwitch = os.clock()
+                end
+            end
+        else
+            lockedTarget = newTarget
+            if newTarget then
+                lastTargetSwitch = os.clock()
+            end
+        end
+    else
+        targetLoseTimer = targetLoseTimer + dt
+        if targetLoseTimer > CONST.TARGET_LOSE_TIMEOUT then
+            lockedTarget = nil
+            currentTarget = nil
+        end
+    end
+    currentTarget = lockedTarget
+
+    if rageActiveNow and (RageConfig.RageFeatures.AutoFire or RageConfig.RageFeatures.RapidFire) then
+        if not autoFireThread and not autoFireLock then
+            startAutoFireLoop()
+        end
+    else
+        stopAutoFireLoop()
+    end
+
+    if Config.Aimbot.CameraEnabled and aimActive and currentTarget and myHrp then
+        local predictedPos = getPredictedPosition(currentTarget)
+        local targetPos = predictedPos
+        if Config.Aimbot.RCSEnabled and Config.Aimbot.RCSAdaptiveLearning then
+            targetPos = applyAdaptiveRCS(targetPos)
+        end
+        local targetCF = CFrame.new(cachedCameraCFrame.Position, targetPos)
+        Camera.CFrame = applySmoothing(cachedCameraCFrame, targetCF, currentTarget, dt)
+    end
+end
+
+-- ===== ESP UPDATE =====
+local function updateESP()
+    if isUnloaded or not Config.ESP.Enabled then
+        for _,d in pairs(playersData) do
+            hideAll(d)
+        end
+        return
+    end
+    
+    if Config.Aimbot.UseDeferESP then
+        task.spawn(function()
+            if updateESPSync then
+                updateESPSync()
+            end
+        end)
+        return
+    end
+    
+    if updateESPSync then
+        updateESPSync()
+    end
+end
+
+updateESPSync = function()
+    local now = os.clock()
+    local full = now - lastFullUpdate >= CONST.FULL_UPDATE_INTERVAL
+    local skeleton = now - lastSkeletonUpdate >= CONST.SKELETON_INTERVAL
+    local text = now - lastTextUpdate >= CONST.TEXT_INTERVAL
+    local arrow = now - lastArrowUpdate >= CONST.ARROW_INTERVAL
+
+    if full then
+        lastFullUpdate = now
+        for plr, d in pairs(playersData) do
+            local parts = d.parts
+            local hrp = parts and parts.HumanoidRootPart
+            local head = parts and parts.Head
+            local hum = parts and parts.humanoid
+            if not (hrp and head and hum and hum.Health > 0 and parts.Character and parts.Character.Parent and isPartValid(hrp)) then
+                hideAll(d)
+                renderData[plr] = nil
+                goto continue
+            end
+            if Config.ESP.HideTeammates and isTeammate(plr) then
+                hideAll(d)
+                renderData[plr] = nil
+                goto continue
+            end
+            local screenPos3D, onScreen = Camera:WorldToScreenPoint(hrp.Position)
+            local hrpPos = Vector2.new(screenPos3D.X, screenPos3D.Y)
+            if not onScreen then
+                hideAll(d)
+                renderData[plr] = nil
+                goto continue
+            end
+            local dist = (cachedCameraCFrame.Position - hrp.Position).Magnitude
+            if dist > Config.ESP.MaxDistance or dist < Config.ESP.MinDistance then
+                hideAll(d)
+                renderData[plr] = nil
+                goto continue
+            end
+            local visible = false
+            if Config.ESP.VisibleCheck then
+                visible = isVisibleCached(d, head)
+            end
+            local rd = renderData[plr] or {}
+            rd.onScreen = onScreen
+            rd.hrpPos = hrpPos
+            rd.distance = dist
+            rd.visible = visible
+            rd.parts = parts
+            renderData[plr] = rd
+            ::continue::
+        end
+
+        if Config.ESP.PriorityTarget then
+            local bestScore = -math.huge
+            local bestPlr
+            local maxDist = Config.ESP.MaxDistance
+            local halfW = Camera.ViewportSize.X / 2
+            for plr, rd in pairs(renderData) do
+                if rd and rd.onScreen and not (Config.ESP.HideTeammates and isTeammate(plr)) then
+                    local normDist = rd.distance / maxDist
+                    local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+                    local distToCenter = (rd.hrpPos - center).Magnitude
+                    local normPixels = distToCenter / halfW
+                    local score = (rd.visible and 1 or 0) - normDist - normPixels * 0.5
+                    if score > bestScore then
+                        bestScore = score
+                        bestPlr = plr
+                    end
+                end
+            end
+            for plr, rd in pairs(renderData) do
+                if rd then
+                    rd.priority = (plr == bestPlr)
+                end
+            end
+        end
+
+        for plr, rd in pairs(renderData) do
+            local d = playersData[plr]
+            if d and rd then
+                updateBoxPosition(d, rd.parts, rd)
+            end
+        end
+    end
+
+    if skeleton then
+        lastSkeletonUpdate = now
+        for plr, rd in pairs(renderData) do
+            local d = playersData[plr]
+            if d and rd then
+                updateSkeletonOptimized(d, rd.parts, rd)
+            end
+        end
+    end
+
+    if text then
+        lastTextUpdate = now
+        for plr, rd in pairs(renderData) do
+            local d = playersData[plr]
+            if d and rd then
+                updateTextOptimized(d, rd.parts, rd)
+                
+                if Config.ESP.ShowTracer then
+                    if not d.tracer then
+                        d.tracer = getFromPool(drawingPool.tracers, "Line")
+                        d.tracer.Thickness = Config.ESP.TracerThickness
+                    end
+                    if rd.onScreen and rd.distance <= Config.ESP.MaxDistance and rd.distance >= Config.ESP.MinDistance then
+                        local sc = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y)
+                        d.tracer.From = sc
+                        d.tracer.To = Vector2.new(rd.hrpPos.X, rd.hrpPos.Y + 30)
+                        d.tracer.Color = rd.priority and Config.ESP.PriorityColor or Config.ESP.TracerColor
+                        d.tracer.Visible = true
+                    else
+                        d.tracer.Visible = false
+                    end
+                elseif d.tracer then
+                    d.tracer.Visible = false
+                end
+            end
+        end
+    end
+
+    if arrow then
+        lastArrowUpdate = now
+        for plr, rd in pairs(renderData) do
+            local d = playersData[plr]
+            if d and rd then
+                updateArrowOptimized(d, rd)
+            end
+        end
+    end
+end
+
+-- ===== RAGE (Anti-Aim) =====
+local function createAntiAim(mode)
+    if RageConfig.RageFeatures.Spinbot and mode == "Off" then
+        mode = "Spin"
+    end
+    
+    if mode == "Off" then
+        if antiAimGyro then
+            destroyAntiAim()
+        end
+        return
+    end
+    local char = LP.Character
+    if not char then
+        return
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        return
+    end
+    if antiAimGyro and antiAimGyro.Mode == mode then
+        return
+    end
+    if antiAimGyro then
+        destroyAntiAim()
+    end
+
+    local align = Instance.new("AlignOrientation")
+    align.Mode = Enum.OrientationAlignmentMode.TwoAttachment
+    align.MaxTorque = 100000
+    align.MaxAngularVelocity = 100
+    align.Responsiveness = 100
+    align.Parent = hrp
+
+    local att0 = Instance.new("Attachment")
+    att0.Parent = hrp
+    local att1 = Instance.new("Attachment")
+    att1.WorldCFrame = hrp.CFrame
+    att1.Parent = hrp
+    align.Attachment0 = att0
+    align.Attachment1 = att1
+    antiAimGyro = { Align = align, Att0 = att0, Att1 = att1, Mode = mode }
+end
+
+destroyAntiAim = function()
+    if antiAimGyro then
+        if antiAimGyro.Att0 then
+            antiAimGyro.Att0:Destroy()
+        end
+        if antiAimGyro.Att1 then
+            antiAimGyro.Att1:Destroy()
+        end
+        if antiAimGyro.Align then
+            antiAimGyro.Align:Destroy()
+        end
+        antiAimGyro = nil
+    end
+end
+
+updateAntiAim = function(dt)
+    if not antiAimGyro then
+        if RageActive and RageConfig.RageFeatures.Spinbot then
+            createAntiAim("Spin")
+        end
+        return
+    end
+    local char = LP.Character
+    if not char then
+        return
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        return
+    end
+
+    local mode = antiAimGyro.Mode
+    if mode == "Spin" then
+        local angSpeed = RageConfig.RageFeatures.SpinSpeed * 2 * math.pi
+        local newCF = hrp.CFrame * CFrame.Angles(0, angSpeed * dt, 0)
+        antiAimGyro.Att1.WorldCFrame = newCF
+    elseif mode == "Jitter" then
+        local angleX = math.random(-20, 20) / 100
+        local angleY = math.random(-20, 20) / 100
+        local angleZ = math.random(-20, 20) / 100
+        local newCF = hrp.CFrame * CFrame.Angles(angleX, angleY, angleZ)
+        antiAimGyro.Att1.WorldCFrame = newCF
+    elseif mode == "StaticDown" then
+        local newCF = hrp.CFrame * CFrame.Angles(math.rad(-90), 0, 0)
+        antiAimGyro.Att1.WorldCFrame = newCF
+    end
+end
+
+local function switchToRageConfig()
+    RageActive = true
+    RageConfig.ESP = table.clone(LegitConfig.ESP)
+    Config = RageConfig
+    if RageConfig.RageFeatures.Enabled and RageConfig.RageMasterSwitch then
+        local mode = RageConfig.RageFeatures.AntiAimMode
+        if RageConfig.RageFeatures.Spinbot and mode == "Off" then
+            mode = "Spin"
+        end
+        createAntiAim(mode)
+    end
+end
+
+local function switchToLegitConfig()
+    RageActive = false
+    Config = LegitConfig
+    destroyAntiAim()
+    stopAutoFireLoop()
+end
+
+local function applyRageToggle(enabled)
+    if enabled then
+        switchToRageConfig()
+    else
+        switchToLegitConfig()
+    end
+end
+
+-- ===== FPS =====
+updateFrameTimeProfiler = function()
+    if not Config.ESP.ShowFPS then
+        return
+    end
+    local now = os.clock()
+    local frameTime = now - lastFrameTime
+    table.insert(frameDurations, frameTime)
+    if #frameDurations > CONST.FPS_SAMPLE_COUNT then
+        table.remove(frameDurations, 1)
+    end
+    local avgTime = 0
+    for _, v in ipairs(frameDurations) do
+        avgTime = avgTime + v
+    end
+    avgTime = avgTime / #frameDurations
+    lastFrameTime = now
+    if frameTimeLabel then
+        frameTimeLabel.Text = string.format("Frame: %.2f ms", avgTime * 1000)
+        frameTimeLabel.Visible = true
+    end
+end
+
+local function createFPSDisplay()
+    if fpsLabel then
+        return
+    end
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "FPSDisplay"
+    gui.ResetOnSpawn = false
+    gui.Parent = LP:WaitForChild("PlayerGui")
+
+    fpsLabel = Instance.new("TextLabel", gui)
+    fpsLabel.Size = UDim2.new(0, 100, 0, 20)
+    fpsLabel.Position = UDim2.new(1, -110, 0, 10)
+    fpsLabel.BackgroundTransparency = 1
+    fpsLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    fpsLabel.TextStrokeTransparency = 0.5
+    fpsLabel.Font = Enum.Font.SourceSansBold
+    fpsLabel.TextSize = 12
+
+    drawCountLabel = Instance.new("TextLabel", gui)
+    drawCountLabel.Size = UDim2.new(0, 100, 0, 20)
+    drawCountLabel.Position = UDim2.new(1, -110, 0, 30)
+    drawCountLabel.BackgroundTransparency = 1
+    drawCountLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    drawCountLabel.Font = Enum.Font.SourceSans
+    drawCountLabel.TextSize = 10
+
+    frameTimeLabel = Instance.new("TextLabel", gui)
+    frameTimeLabel.Size = UDim2.new(0, 100, 0, 20)
+    frameTimeLabel.Position = UDim2.new(1, -110, 0, 50)
+    frameTimeLabel.BackgroundTransparency = 1
+    frameTimeLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    frameTimeLabel.Font = Enum.Font.SourceSans
+    frameTimeLabel.TextSize = 10
+end
+
+local function updateFPSDisplay(dt)
+    if dt <= 0 then return end
+    
+    if not Config.ESP.ShowFPS then
+        if fpsLabel then
+            fpsLabel.Visible = false
+        end
+        if drawCountLabel then
+            drawCountLabel.Visible = false
+        end
+        if frameTimeLabel then
+            frameTimeLabel.Visible = false
+        end
+        return
+    end
+    if not fpsLabel then
+        createFPSDisplay()
+    end
+    fpsLabel.Visible = true
+    drawCountLabel.Visible = true
+    if frameTimeLabel then
+        frameTimeLabel.Visible = true
+    end
+
+    local inst = 1 / dt
+    fpsSum = fpsSum + inst
+    fpsCount = fpsCount + 1
+    if fpsCount >= CONST.FPS_SAMPLE_COUNT then
+        currentFPS = fpsSum / fpsCount
+        fpsSum = 0
+        fpsCount = 0
+    end
+
+    if os.clock() - lastDrawCountUpdate > CONST.DRAW_COUNT_UPDATE_INTERVAL then
+        drawCountValue = 0
+        for _, p in pairs(drawingPool) do
+            drawCountValue = drawCountValue + #p
+        end
+        lastDrawCountUpdate = os.clock()
+    end
+
+    drawCountLabel.Text = string.format("Draw: %d", drawCountValue)
+    fpsLabel.Text = string.format("FPS: %.1f", currentFPS)
+    if updateFrameTimeProfiler then
+        updateFrameTimeProfiler()
+    end
+end
+
+-- ===== GUI =====
+local Window = Library:CreateWindow({
+    Title = "glupost hub",
+    Footer = "v16.8.8",
+    NotifySide = "Right",
+    ShowCustomCursor = true
+})
+local Tabs = {
+    Main = Window:AddTab("Main", "user"),
+    Visuals = Window:AddTab("Visuals", "palette"),
+    Aimbot = Window:AddTab("Aimbot", "crosshair"),
+    Rage = Window:AddTab("Rage", "skull"),
+    Advanced = Window:AddTab("Advanced", "wrench"),
+    Profiles = Window:AddTab("Profiles", "database"),
+    ["UI Settings"] = Window:AddTab("UI Settings", "settings")
+}
+local Options = Library.Options
+
+-- Main
+local mainLeft = Tabs.Main:AddLeftGroupbox("General")
+mainLeft:AddToggle("ESPEnabled", {
+    Text = "Enable ESP",
+    Default = true,
+    Callback = function(v)
+        Config.ESP.Enabled = v
+    end
+})
+mainLeft:AddDropdown("BoxType", {
+    Text = "Box Type",
+    Values = {"2D", "3D", "Corner"},
+    Default = "2D",
+    Callback = function(v)
+        Config.ESP.BoxType = v
+    end
+})
+mainLeft:AddSlider("MaxDistance", {
+    Text = "Max Distance",
+    Default = 500,
+    Min = 50,
+    Max = 2000,
+    Rounding = 0,
+    Callback = function(v)
+        Config.ESP.MaxDistance = v
+    end
+})
+mainLeft:AddSlider("MinDistance", {
+    Text = "Min Distance",
+    Default = 0,
+    Min = 0,
+    Max = 200,
+    Rounding = 0,
+    Callback = function(v)
+        Config.ESP.MinDistance = v
+    end
+})
+mainLeft:AddToggle("HideTeammates", {
+    Text = "Hide Teammates",
+    Default = false,
+    Callback = function(v)
+        Config.ESP.HideTeammates = v
+    end
+})
+mainLeft:AddToggle("ShowFPS", {
+    Text = "Show FPS Counter",
+    Default = false,
+    Callback = function(v)
+        Config.ESP.ShowFPS = v
+    end
+})
+mainLeft:AddToggle("VisibleCheck", {
+    Text = "Visible Check",
+    Default = true,
+    Callback = function(v)
+        Config.ESP.VisibleCheck = v
+    end
+})
+mainLeft:AddToggle("ShowThreatScore", {
+    Text = "Show Threat Score",
+    Default = false,
+    Callback = function(v)
+        Config.ESP.ShowThreatScore = v
+    end
+})
+
+local teamGroup = Tabs.Main:AddRightGroupbox("Team Colors")
+teamGroup:AddColorPicker("EnemyColor", {
+    Text = "Enemy Color",
+    Default = Color3.fromRGB(255, 0, 0),
+    Callback = function(c)
+        Config.ESP.EnemyColor = c
+    end
+})
+teamGroup:AddColorPicker("AllyColor", {
+    Text = "Ally Color",
+    Default = Color3.fromRGB(0, 255, 0),
+    Callback = function(c)
+        Config.ESP.AllyColor = c
+    end
+})
+
+-- Visuals
+local visualLeft = Tabs.Visuals:AddLeftGroupbox("Skeleton & Tracers")
+visualLeft:AddToggle("SkeletonEnabled", {
+    Text = "Show Skeleton",
+    Default = false,
+    Callback = function(v)
+        Config.ESP.Skeleton = v
+    end
+})
+visualLeft:AddToggle("ShowTracer", {
+    Text = "Show Tracer",
+    Default = false,
+    Callback = function(v)
+        Config.ESP.ShowTracer = v
+    end
+})
+visualLeft:AddColorPicker("SkeletonColor", {
+    Text = "Skeleton Color",
+    Default = Color3.fromRGB(255, 0, 0),
+    Callback = function(c)
+        Config.ESP.SkeletonColor = c
+    end
+})
+visualLeft:AddSlider("SkeletonThickness", {
+    Text = "Skeleton Thickness",
+    Default = 2,
+    Min = 1,
+    Max = 5,
+    Rounding = 0,
+    Callback = function(v)
+        Config.ESP.SkeletonThickness = v
+    end
+})
+visualLeft:AddColorPicker("TracerColor", {
+    Text = "Tracer Color",
+    Default = Color3.fromRGB(255, 255, 255),
+    Callback = function(c)
+        Config.ESP.TracerColor = c
+    end
+})
+visualLeft:AddSlider("TracerThickness", {
+    Text = "Tracer Thickness",
+    Default = 1,
+    Min = 1,
+    Max = 4,
+    Rounding = 0,
+    Callback = function(v)
+        Config.ESP.TracerThickness = v
+    end
+})
+
+local visualRight = Tabs.Visuals:AddRightGroupbox("Chams & Text")
+visualRight:AddToggle("Chams", {
+    Text = "Enable Chams",
+    Default = false,
+    Callback = function(v)
+        Config.ESP.Chams = v
+        for _, d in pairs(playersData) do
+            local ch = d.parts and d.parts.Character
+            if ch then
+                if v then
+                    if d.highlight and d.highlight.Parent == ch then
+                        d.highlight.FillColor = Config.ESP.ChamsVisibleColor
+                        d.highlight.OutlineColor = Config.ESP.ChamsOccludedColor
+                        d.highlight.FillTransparency = Config.ESP.ChamsTransparency
+                        d.highlight.Enabled = true
+                    else
+                        if d.highlight then
+                            safeDestroy(d.highlight)
+                        end
+                        local hl = Instance.new("Highlight")
+                        hl.Name = "GlupostESPHighlight"
+                        hl.FillColor = Config.ESP.ChamsVisibleColor
+                        hl.OutlineColor = Config.ESP.ChamsOccludedColor
+                        hl.FillTransparency = Config.ESP.ChamsTransparency
+                        hl.Parent = ch
+                        d.highlight = hl
+                    end
+                else
+                    if d.highlight then
+                        d.highlight.Enabled = false
+                    end
+                end
+            end
+        end
+    end
+})
+visualRight:AddColorPicker("ChamsVisibleColor", {
+    Text = "Visible Chams Color",
+    Default = Color3.fromRGB(0, 255, 0),
+    Callback = function(c)
+        Config.ESP.ChamsVisibleColor = c
+    end
+})
+visualRight:AddColorPicker("ChamsOccludedColor", {
+    Text = "Occluded Chams Color",
+    Default = Color3.fromRGB(255, 0, 0),
+    Callback = function(c)
+        Config.ESP.ChamsOccludedColor = c
+    end
+})
+visualRight:AddSlider("ChamsTransparency", {
+    Text = "Chams Transparency",
+    Default = 0.5,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.05,
+    Callback = function(v)
+        Config.ESP.ChamsTransparency = v
+    end
+})
+visualRight:AddToggle("ShowName", {
+    Text = "Show Name",
+    Default = true,
+    Callback = function(v)
+        Config.ESP.ShowName = v
+    end
+})
+visualRight:AddToggle("ShowHealth", {
+    Text = "Show Health",
+    Default = true,
+    Callback = function(v)
+        Config.ESP.ShowHealth = v
+    end
+})
+visualRight:AddToggle("ShowDistance", {
+    Text = "Show Distance",
+    Default = true,
+    Callback = function(v)
+        Config.ESP.ShowDistance = v
+    end
+})
+
+-- Aimbot
+local aimLeft = Tabs.Aimbot:AddLeftGroupbox("Aimbot Settings")
+aimLeft:AddToggle("AimbotEnabled", {
+    Text = "Enable Aimbot",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.Enabled = v
+    end
+})
+aimLeft:AddToggle("CameraEnabled", {
+    Text = "Camera Aimbot",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.CameraEnabled = v
+    end
+})
+aimLeft:AddToggle("SilentEnabled", {
+    Text = "Silent Aimbot",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.SilentEnabled = v
+    end
+})
+aimLeft:AddDropdown("TargetPart", {
+    Text = "Target Part",
+    Values = {"Head", "Torso", "HumanoidRootPart"},
+    Default = "Head",
+    Callback = function(v)
+        Config.Aimbot.TargetPart = v
+    end
+})
+aimLeft:AddToggle("TeamCheck", {
+    Text = "Ignore Teammates",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.TeamCheck = v
+    end
+})
+aimLeft:AddToggle("WallCheck", {
+    Text = "Wall Check",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.WallCheck = v
+    end
+})
+aimLeft:AddDropdown("SmoothnessType", {
+    Text = "Smoothness Type",
+    Values = {"HumanLike", "Linear", "Easing", "Instant"},
+    Default = "HumanLike",
+    Callback = function(v)
+        Config.Aimbot.SmoothnessType = v
+    end
+})
+aimLeft:AddSlider("Smoothness", {
+    Text = "Smoothness",
+    Default = 0.3,
+    Min = 0.05,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.Smoothness = v
+    end
+})
+aimLeft:AddSlider("HumanizeOscillation", {
+    Text = "Oscillation",
+    Default = 2.5,
+    Min = 0,
+    Max = 10,
+    Rounding = 0.1,
+    Callback = function(v)
+        Config.Aimbot.HumanizeOscillation = v
+    end
+})
+aimLeft:AddSlider("HumanizeFrequency", {
+    Text = "Frequency",
+    Default = 1.2,
+    Min = 0.1,
+    Max = 5,
+    Rounding = 0.1,
+    Callback = function(v)
+        Config.Aimbot.HumanizeFrequency = v
+    end
+})
+aimLeft:AddToggle("RCSEnabled", {
+    Text = "RCS Enabled",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.RCSEnabled = v
+    end
+})
+aimLeft:AddToggle("RCSAdaptiveLearning", {
+    Text = "Adaptive RCS Learn",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.RCSAdaptiveLearning = v
+    end
+})
+aimLeft:AddSlider("RCSStrength", {
+    Text = "RCS Strength",
+    Default = 0.6,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.RCSStrength = v
+    end
+})
+aimLeft:AddDropdown("PriorityMode", {
+    Text = "Priority Mode",
+    Values = {"Threat", "Distance", "Crosshair", "Health", "Visible"},
+    Default = "Threat",
+    Callback = function(v)
+        Config.Aimbot.PriorityMode = v
+    end
+})
+aimLeft:AddKeybind("AimbotKeybind", {
+    Text = "Activation Key",
+    Default = "MouseButton2",
+    Mode = "Hold",
+    Callback = function(v)
+        Config.Aimbot.AimbotKey = v
+    end,
+    ChangedCallback = function(v)
+        Config.Aimbot.AimbotKey = v
+    end
+})
+aimLeft:AddToggle("Humanize", {
+    Text = "Human-like Behavior",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.Humanize = v
+    end
+})
+aimLeft:AddSlider("ReactionTime", {
+    Text = "Reaction Time (s)",
+    Default = 0.03,
+    Min = 0,
+    Max = 0.2,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.ReactionTime = v
+    end
+})
+aimLeft:AddToggle("Prediction", {
+    Text = "Prediction",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.Prediction = v
+    end
+})
+aimLeft:AddSlider("PredictionFactor", {
+    Text = "Prediction Factor",
+    Default = 0.08,
+    Min = 0,
+    Max = 0.2,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.PredictionFactor = v
+    end
+})
+aimLeft:AddSlider("TargetSwitchDelay", {
+    Text = "Switch Delay (s)",
+    Default = 0.1,
+    Min = 0,
+    Max = 0.5,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.TargetSwitchDelay = v
+    end
+})
+aimLeft:AddToggle("UseDeferESP", {
+    Text = "Async ESP (experimental)",
+    Default = false,
+    Callback = function(v)
+        Config.Aimbot.UseDeferESP = v
+    end
+})
+
+local aimSilentGroup = Tabs.Aimbot:AddLeftGroupbox("Silent Aim Advanced")
+aimSilentGroup:AddToggle("RandomBone", {
+    Text = "Random Bone",
+    Default = false,
+    Callback = function(v)
+        Config.Aimbot.RandomBone = v
+    end
+})
+aimSilentGroup:AddSlider("SilentMaxAngle", {
+    Text = "Max Angle (deg)",
+    Default = 30,
+    Min = 0,
+    Max = 90,
+    Rounding = 0,
+    Callback = function(v)
+        Config.Aimbot.SilentMaxAngle = v
+    end
+})
+aimSilentGroup:AddSlider("BoneWeightHead", {
+    Text = "Head Weight",
+    Default = 0.15,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.BoneWeights.Head = v
+    end
+})
+aimSilentGroup:AddSlider("BoneWeightTorso", {
+    Text = "Torso Weight",
+    Default = 0.60,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.BoneWeights.Torso = v
+    end
+})
+aimSilentGroup:AddSlider("BoneWeightLowerTorso", {
+    Text = "Lower Torso Weight",
+    Default = 0.25,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.BoneWeights.LowerTorso = v
+    end
+})
+
+local aimRight = Tabs.Aimbot:AddRightGroupbox("FOV")
+aimRight:AddToggle("ShowFOV", {
+    Text = "Show FOV",
+    Default = true,
+    Callback = function(v)
+        Config.Aimbot.ShowFOV = v
+    end
+})
+aimRight:AddDropdown("FOVShape", {
+    Text = "Shape",
+    Values = {"Circle", "Square"},
+    Default = "Circle",
+    Callback = function(v)
+        Config.Aimbot.FOVShape = v
+    end
+})
+aimRight:AddSlider("FOVRadius", {
+    Text = "Radius (pixels)",
+    Default = 150,
+    Min = 30,
+    Max = 500,
+    Rounding = 0,
+    Callback = function(v)
+        Config.Aimbot.FOVRadius = v
+    end
+})
+aimRight:AddToggle("DynamicFOV", {
+    Text = "Dynamic FOV",
+    Default = false,
+    Callback = function(v)
+        Config.Aimbot.DynamicFOV = v
+    end
+})
+aimRight:AddColorPicker("FOVColor", {
+    Text = "Color",
+    Default = Color3.fromRGB(255, 255, 255),
+    Callback = function(c)
+        Config.Aimbot.FOVColor = c
+    end
+})
+aimRight:AddSlider("FOVThickness", {
+    Text = "Thickness",
+    Default = 2,
+    Min = 1,
+    Max = 5,
+    Rounding = 0,
+    Callback = function(v)
+        Config.Aimbot.FOVThickness = v
+    end
+})
+aimRight:AddToggle("FilledFOV", {
+    Text = "Filled",
+    Default = false,
+    Callback = function(v)
+        Config.Aimbot.FilledFOV = v
+    end
+})
+aimRight:AddSlider("FOVTransparency", {
+    Text = "Fill Transparency",
+    Default = 0.3,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.05,
+    Callback = function(v)
+        Config.Aimbot.FOVTransparency = v
+    end
+})
+
+-- Rage
+local rageGroup = Tabs.Rage:AddLeftGroupbox("Rage Settings")
+rageGroup:AddToggle("RageEnabled", {
+    Text = "Enable Rage Mode",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.Enabled = v
+        RageConfig.RageMasterSwitch = v
+        applyRageToggle(v)
+    end
+})
+rageGroup:AddToggle("RageAutoFire", {
+    Text = "Auto Fire",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.AutoFire = v
+    end
+})
+rageGroup:AddToggle("RageRapidFire", {
+    Text = "Rapid Fire",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.RapidFire = v
+    end
+})
+rageGroup:AddToggle("RageNoSpread", {
+    Text = "No Spread",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.NoSpread = v
+    end
+})
+rageGroup:AddToggle("RageAutoWall", {
+    Text = "Auto Wall",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.AutoWall = v
+    end
+})
+rageGroup:AddToggle("RageTriggerbot", {
+    Text = "Triggerbot",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.Triggerbot = v
+    end
+})
+rageGroup:AddToggle("RageKillAura", {
+    Text = "Kill Aura",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.KillAura = v
+    end
+})
+rageGroup:AddSlider("RageKillAuraRadius", {
+    Text = "Kill Aura Radius",
+    Default = 100,
+    Min = 10,
+    Max = 200,
+    Rounding = 0,
+    Callback = function(v)
+        RageConfig.RageFeatures.KillAuraRadius = v
+    end
+})
+rageGroup:AddToggle("RageSpinbot", {
+    Text = "Spinbot",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.Spinbot = v
+        if RageActive then
+            local mode = RageConfig.RageFeatures.AntiAimMode
+            if v and mode == "Off" then
+                mode = "Spin"
+            end
+            createAntiAim(mode)
+        end
+    end
+})
+rageGroup:AddSlider("RageSpinSpeed", {
+    Text = "Spin Speed",
+    Default = 25,
+    Min = 1,
+    Max = 50,
+    Rounding = 0,
+    Callback = function(v)
+        RageConfig.RageFeatures.SpinSpeed = v
+    end
+})
+rageGroup:AddDropdown("RageAntiAimMode", {
+    Text = "Anti-Aim Mode",
+    Values = {"Off", "Spin", "Jitter", "StaticDown"},
+    Default = "Off",
+    Callback = function(v)
+        RageConfig.RageFeatures.AntiAimMode = v
+        if RageActive and RageConfig.RageFeatures.Enabled and RageConfig.RageMasterSwitch then
+            local mode = v
+            if RageConfig.RageFeatures.Spinbot and mode == "Off" then
+                mode = "Spin"
+            end
+            createAntiAim(mode)
+        end
+    end
+})
+rageGroup:AddToggle("RageTeleportKill", {
+    Text = "Teleport Kill",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.TeleportKill = v
+    end
+})
+rageGroup:AddKeybind("RageTeleportKey", {
+    Text = "Teleport Key",
+    Default = "Q",
+    Callback = function(v)
+        RageConfig.RageFeatures.TeleportKey = v
+    end,
+    ChangedCallback = function(v)
+        RageConfig.RageFeatures.TeleportKey = v
+    end
+})
+rageGroup:AddToggle("RageMultiPoint", {
+    Text = "Multi-Point (spread)",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.MultiPoint = v
+    end
+})
+rageGroup:AddSlider("RageMultiPointSpread", {
+    Text = "Multi-Point Spread",
+    Default = 2.0,
+    Min = 0.5,
+    Max = 5.0,
+    Rounding = 0.1,
+    Callback = function(v)
+        RageConfig.RageFeatures.MultiPointSpread = v
+    end
+})
+rageGroup:AddToggle("RageDoubleTap", {
+    Text = "Double Tap",
+    Default = false,
+    Callback = function(v)
+        RageConfig.RageFeatures.DoubleTap = v
+    end
+})
+rageGroup:AddSlider("RageDTDelay", {
+    Text = "Double Tap Delay",
+    Default = 0.05,
+    Min = 0.01,
+    Max = 0.15,
+    Rounding = 0.01,
+    Callback = function(v)
+        RageConfig.RageFeatures.DTDelay = v
+    end
+})
+
+-- Advanced
+local advLeft = Tabs.Advanced:AddLeftGroupbox("Threat Weights")
+advLeft:AddSlider("WeightVisibility", {
+    Text = "Visibility",
+    Default = 0.4,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.ThreatWeights.Visibility = v
+    end
+})
+advLeft:AddSlider("WeightLookAtMe", {
+    Text = "Look At Me",
+    Default = 0.3,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.ThreatWeights.LookAtMe = v
+    end
+})
+advLeft:AddSlider("WeightDistance", {
+    Text = "Distance",
+    Default = 0.2,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.ThreatWeights.Distance = v
+    end
+})
+advLeft:AddSlider("WeightHealth", {
+    Text = "Health",
+    Default = 0.1,
+    Min = 0,
+    Max = 1,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.ThreatWeights.Health = v
+    end
+})
+
+local advRight = Tabs.Advanced:AddRightGroupbox("Other")
+advRight:AddSlider("HitChance", {
+    Text = "Hit Chance %",
+    Default = 100,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+    Callback = function(v)
+        Config.Aimbot.HitChance = v
+    end
+})
+advRight:AddSlider("VelocitySmoothingAdv", {
+    Text = "Vel Smoothing",
+    Default = 0.7,
+    Min = 0.1,
+    Max = 0.99,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.VelocitySmoothing = v
+    end
+})
+advRight:AddSlider("MouseMoveThresholdAdv", {
+    Text = "RCS Mouse Ignore",
+    Default = 30,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+    Callback = function(v)
+        Config.Aimbot.MouseMoveThreshold = v
+    end
+})
+advRight:AddSlider("GravityFactor", {
+    Text = "Gravity Factor",
+    Default = 1.0,
+    Min = 0,
+    Max = 3.0,
+    Rounding = 0.01,
+    Callback = function(v)
+        Config.Aimbot.GravityFactor = v
+    end
+})
+
+-- Profiles
+local profileGroup = Tabs.Profiles:AddLeftGroupbox("Quick Presets")
+local function safeSet(opt, val)
+    if Options[opt] then
+        Options[opt]:SetValue(val)
+    end
+end
+
+profileGroup:AddButton("Competitive", function()
+    LegitConfig.ESP.MaxDistance = 300
+    LegitConfig.ESP.MinDistance = 10
+    LegitConfig.ESP.Skeleton = true
+    LegitConfig.ESP.ShowTracer = true
+    LegitConfig.ESP.VisibleCheck = true
+    LegitConfig.ESP.BoxThickness = 2
+    LegitConfig.ESP.BoxType = "2D"
+    safeSet("MaxDistance", 300)
+    safeSet("MinDistance", 10)
+    safeSet("SkeletonEnabled", true)
+    safeSet("ShowTracer", true)
+    safeSet("VisibleCheck", true)
+    safeSet("BoxType", "2D")
+end)
+
+profileGroup:AddButton("Performance", function()
+    LegitConfig.ESP.MaxDistance = 200
+    LegitConfig.ESP.MinDistance = 0
+    LegitConfig.ESP.Skeleton = false
+    LegitConfig.ESP.ShowTracer = false
+    LegitConfig.ESP.VisibleCheck = false
+    LegitConfig.ESP.BoxThickness = 1
+    LegitConfig.ESP.BoxType = "2D"
+    LegitConfig.ESP.ShowName = false
+    LegitConfig.ESP.ShowHealth = false
+    LegitConfig.ESP.ShowDistance = false
+    safeSet("MaxDistance", 200)
+    safeSet("MinDistance", 0)
+    safeSet("SkeletonEnabled", false)
+    safeSet("ShowTracer", false)
+    safeSet("VisibleCheck", false)
+    safeSet("BoxType", "2D")
+    safeSet("ShowName", false)
+    safeSet("ShowHealth", false)
+    safeSet("ShowDistance", false)
+end)
+
+profileGroup:AddButton("Max Distance", function()
+    LegitConfig.ESP.MaxDistance = 2000
+    LegitConfig.ESP.MinDistance = 0
+    LegitConfig.ESP.Skeleton = true
+    LegitConfig.ESP.ShowTracer = true
+    LegitConfig.ESP.VisibleCheck = true
+    LegitConfig.ESP.BoxThickness = 3
+    safeSet("MaxDistance", 2000)
+    safeSet("MinDistance", 0)
+    safeSet("SkeletonEnabled", true)
+    safeSet("ShowTracer", true)
+    safeSet("VisibleCheck", true)
+end)
+
+-- UI Settings
+local uiGroup = Tabs["UI Settings"]:AddLeftGroupbox("Menu")
+uiGroup:AddKeyPicker("MenuKeybind", {
+    Default = "RightShift",
+    NoUI = true,
+    Text = "Menu keybind"
+})
+
+uiGroup:AddButton("Unload", function()
+    if unloadHub then
+        unloadHub()
+    end
+end)
+
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({"MenuKeybind"})
+ThemeManager:SetFolder("glupost_hub")
+SaveManager:SetFolder("glupost_hub/configs")
+SaveManager:BuildConfigSection(Tabs["UI Settings"])
+ThemeManager:ApplyToTab(Tabs["UI Settings"])
+SaveManager:LoadAutoloadConfig()
+Library.ToggleKeybind = Options.MenuKeybind.Value
+
+-- ===== ИНИЦИАЛИЗАЦИЯ И ВЫГРУЗКА =====
+local function initESP()
+    for _, p in ipairs(Players:GetPlayers()) do
+        setupPlayer(p)
+    end
+    playerAddedConn = Players.PlayerAdded:Connect(setupPlayer)
+    playerRemovingConn = Players.PlayerRemoving:Connect(function(p)
+        if playersData[p] then
+            destroyAll(playersData[p])
+            playersData[p] = nil
+        end
+        if connections[p] then
+            for _, c in pairs(connections[p]) do
+                if c then
+                    c:Disconnect()
+                end
+            end
+            connections[p] = nil
+        end
+        renderData[p] = nil
+        predictionCache[p] = nil
+        threatScoreCache[p] = nil
+    end)
+end
+
+unloadHub = function()
+    if isUnloaded then
+        return
+    end
+    isUnloaded = true
+    stopAutoFireLoop()
+    destroyAntiAim()
+    removeSilentHook()
+    if recoilConn then
+        recoilConn:Disconnect()
+    end
+    if inputEndedConn then
+        inputEndedConn:Disconnect()
+    end
+    if playerAddedConn then
+        playerAddedConn:Disconnect()
+    end
+    if playerRemovingConn then
+        playerRemovingConn:Disconnect()
+    end
+    if renderSteppedConn then
+        renderSteppedConn:Disconnect()
+    end
+    if hotkeyConn then
+        hotkeyConn:Disconnect()
+    end
+    for _, conns in pairs(connections) do
+        for _, c in pairs(conns) do
+            if c then
+                c:Disconnect()
+            end
+        end
+    end
+    table.clear(connections)
+    for _, d in pairs(playersData) do
+        destroyAll(d)
+    end
+    table.clear(playersData)
+    table.clear(renderData)
+    for _, pool in pairs(drawingPool) do
+        for _, o in ipairs(pool) do
+            safeDestroy(o)
+        end
+        table.clear(pool)
+    end
+    pcall(function()
+        fovDraw:Remove()
+        squareFOV:Remove()
+    end)
+    if fpsLabel then
+        fpsLabel.Visible = false
+    end
+    if drawCountLabel then
+        drawCountLabel.Visible = false
+    end
+    if frameTimeLabel then
+        frameTimeLabel.Visible = false
+    end
+    predictionCache = {}
+    threatScoreCache = {}
+    recoilPatterns = {}
+    recoilPatternOrder = {}
+    Library:Unload()
+end
+
+local function setupHotkeys()
+    hotkeyConn = UIS.InputBegan:Connect(function(inp, gp)
+        if gp then
+            return
+        end
+        if inp.KeyCode == Enum.KeyCode.F1 then
+            Config.ESP.Enabled = not Config.ESP.Enabled
+        elseif inp.KeyCode == Enum.KeyCode.F2 then
+            local types = {"2D", "3D", "Corner"}
+            local idx = table.find(types, Config.ESP.BoxType) or 1
+            idx = idx % 3 + 1
+            Config.ESP.BoxType = types[idx]
+        elseif inp.KeyCode == Enum.KeyCode.F3 then
+            Config.ESP.Skeleton = not Config.ESP.Skeleton
+        end
+    end)
+end
+
+local recoilConn = UIS.InputBegan:Connect(function(input, gp)
+    if gp then
+        return
+    end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if Config.Aimbot.RCSEnabled and Config.Aimbot.RCSAdaptiveLearning then
+            recordRecoilStart()
+        end
+    end
+end)
+
+local inputEndedConn = UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        currentRecoilPattern = nil
+        recoilStep = 0
+    end
+end)
+
+initESP()
+initSilentAimbot()
+
+renderSteppedConn = RunService.RenderStepped:Connect(function(dt)
+    if isUnloaded then
+        return
+    end
+    
+    cachedCameraCFrame = Camera.CFrame
+    cachedCameraPosition = cachedCameraCFrame.Position
+    
+    hookRecoveryTimer = hookRecoveryTimer + dt
+    if hookRecoveryTimer >= CONST.HOOK_RECOVERY_INTERVAL then
+        hookRecoveryTimer = 0
+        recoverHooks()
+    end
+    
+    local success, err = pcall(function()
+        updatePredictionCache()
+        updateKillAuraCache()
+        updateFPSDisplay(dt)
+        updateAimbotLoop(dt)
+        updateESP()
+        updateFOV()
+    end)
+    if not success then
+        warn("glupost hub error: ", err)
+    end
+end)
+
+setupHotkeys()
+
+print("glupost hub v16.8.8 loaded (FINAL - all scope issues fixed)")
